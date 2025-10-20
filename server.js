@@ -11,8 +11,8 @@ const apiKey = process.env.GOOGLE_API_KEY;
 if (!apiKey) { console.error("❌ FATAL ERROR: GOOGLE_API_KEY missing!"); process.exit(1); }
 const genAI = new GoogleGenerativeAI(apiKey);
 // --- Use the model that worked best for you (1.0-pro recommended for accuracy) ---
-const model = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
-console.log("Using AI Model:", "gemini-1.0-pro");
+const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+console.log("Using AI Model:", "gemini-flash-latest");
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
