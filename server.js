@@ -28,7 +28,7 @@ if (!apiKey) {
 console.log("✅ 7. Google API key found.");
 
 const genAI = new GoogleGenerativeAI(apiKey);
-const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro' });
+const model = genAI.getGenerativeModel({ model: 'gemini-pro' });
 console.log("✅ 8. AI Model selected.");
 
 // --- NEW SUPABASE SETUP ---
@@ -170,31 +170,36 @@ async function getAIDecision(url, apiKey) {
   }
 }
 
-// --- UPDATED: API Endpoint ---
-app.get('/check-url', async (req, res) => {
-  const url = req.query.url;
+// --- API Endpoint (Should be POST) ---
+app.post('/check-url', async (req, res) => { // <-- CORRECT: app.post
   
-  // --- THIS IS THE MODIFIED PART ---
+  // Data now comes from the request body
+  const pageData = req.body; 
+  const url = pageData?.url; // Get URL from body data
 
-  // 1. We're changing 'x-api-key' to 'authorization'
   const authHeader = req.headers['authorization']; 
-
-  // 2. We're adding this line to split the "Bearer " part off the key
   const apiKey = authHeader ? authHeader.split(' ')[1] : null; 
   
-  // --- END OF MODIFIED PART ---
-  
-  console.log('Received a request for:', url);
+  console.log('Received POST request for:', url || 'No URL in body');
 
-  if (url.startsWith('chrome://') || url.startsWith('chrome-extension://')) {
-    console.log('Ignoring internal Chrome URL.');
-    res.json({ decision: 'ALLOW' }); 
-    return;
+  // Basic validation
+  if (!url || !apiKey) {
+      console.error('Missing URL in request body or API key in header.');
+      // Send an error response back to the extension
+      return res.status(400).json({ error: 'Missing URL or API Key' }); 
   }
-  
-  // Pass the apiKey to the decision function
-  const decision = await getAIDecision(url, apiKey);
-  res.json({ decision: decision });
+
+  // No need to check for chrome:// URLs here, content script shouldn't send them
+
+  try {
+    // Pass the entire pageData object to the decision function
+    const decision = await getAIDecision(pageData, apiKey); 
+    res.json({ decision: decision });
+  } catch (err) {
+      // Catch any unexpected errors during processing
+      console.error("Error processing /check-url:", err);
+      res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
 // --- Start the server ---
