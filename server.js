@@ -81,26 +81,41 @@ async function getAIDecision(pageData, apiKey) {
   }
 }
 
-// --- API Endpoint (Correct POST handling) ---
-app.post('/check-url', async (req, res) => { // <-- Ensure this is app.post
-
-  // Data now comes from the request body
+// --- API Endpoint (Add Search Check) ---
+app.post('/check-url', async (req, res) => {
   const pageData = req.body;
-  const url = pageData?.url; // Get URL from body data
-
+  const url = pageData?.url;
   const authHeader = req.headers['authorization'];
   const apiKey = authHeader ? authHeader.split(' ')[1] : null;
 
   console.log('Received POST request for:', url || 'No URL in body');
 
-  // Basic validation
+  // --- NEW: Immediately ALLOW known search engine results pages ---
+  try {
+      if (url) {
+          const urlObj = new URL(url);
+          const hostname = urlObj.hostname;
+          // Add more search engines if needed
+          if ((hostname.includes("google.") || hostname.includes("bing.") || hostname.includes("duckduckgo.")) && urlObj.pathname.startsWith("/search")) {
+              console.log("Search engine results page detected. Allowing automatically.");
+              res.json({ decision: 'ALLOW' });
+              return; // Stop processing, send ALLOW
+          }
+      }
+  } catch (e) {
+      console.warn("Error checking for search engine URL:", e); // Log error but continue
+  }
+  // --- END NEW SEARCH CHECK ---
+
+
+  // Basic validation (still important)
   if (!url || !apiKey) {
       console.error('Missing URL in body or API key in header.');
       return res.status(400).json({ error: 'Missing URL or API Key' });
   }
 
+  // If not a search page, proceed with AI check
   try {
-    // Pass the entire pageData object to the decision function
     const decision = await getAIDecision(pageData, apiKey);
     res.json({ decision: decision });
   } catch (err) {
