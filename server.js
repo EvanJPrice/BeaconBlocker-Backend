@@ -40,6 +40,31 @@ function getDomainFromUrl(urlString) {
     } catch (e) { console.error("Error extracting domain:", e); return null; }
 }
 
+// Helper function to log blocking events
+async function logBlockingEvent(logData) {
+    const { userId, url, decision, reason, pageTitle } = logData;
+    if (!userId) {
+        console.error("Cannot log event: userId is missing.");
+        return; // Don't try to log if we don't know who it's for
+    }
+    try {
+        const domain = getDomainFromUrl(url); // Use your existing helper
+        const { error } = await supabase.from('blocking_log').insert({
+            user_id: userId,
+            url: url || 'Unknown URL',
+            domain: domain || 'Unknown Domain',
+            decision: decision,
+            reason: reason,
+            page_title: pageTitle || ''
+        });
+        if (error) {
+            console.error("Error logging event:", error.message);
+        }
+    } catch (err) {
+        console.error("Exception during logging:", err.message);
+    }
+}
+
 // --- UPDATED: Database Function - Fetches Structured Rule ---
 async function getUserRuleData(apiKey) {
     if (!apiKey) {
@@ -52,7 +77,7 @@ async function getUserRuleData(apiKey) {
     // Fetch all the relevant columns now
     const { data, error } = await supabase
         .from('rules')
-        .select('prompt, allow_list, block_list, blocked_categories') // Select new columns
+        .select('user_id, prompt, allow_list, block_list, blocked_categories') // Select new columns
         .eq('api_key', apiKey)
         .single(); // Use .single() now that we know the key exists
 
@@ -146,48 +171,62 @@ Respond with *only* the single word: ALLOW or BLOCK
     }
 }
 
-// --- API Endpoint (UPDATED with structured data pre-filtering) ---
 app.post('/check-url', async (req, res) => {
     const pageData = req.body;
     const url = pageData?.url;
     const authHeader = req.headers['authorization'];
     const apiKey = authHeader ? authHeader.split(' ')[1] : null;
 
-    console.log('Received POST request for:', url || 'No URL in body');
-
     if (!url || !apiKey) {
+        // Don't log here, as we don't have a user
         return res.status(400).json({ error: 'Missing URL or API Key' });
     }
 
+    let userId = null; // Variable to hold the user ID
+
     try {
-        // --- PRE-FILTERING uses structured data ---
-        // 1. Fetch the structured rule data
         const ruleData = await getUserRuleData(apiKey);
-        const { allow_list, block_list } = ruleData; // Get lists directly
+
+        // We now have the user_id from the ruleData!
+        userId = ruleData?.user_id; 
 
         // 2. Get the current domain
+        const { allow_list, block_list } = ruleData;
         const currentDomain = getDomainFromUrl(url);
 
         // 3. Check Allow List (using array includes/endsWith)
         if (currentDomain && allow_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
             console.log(`URL domain (${currentDomain}) matches Allow list. ALLOWING.`);
+            // Log the event
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
         // 4. Check Block List (using array includes/endsWith)
         if (currentDomain && block_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
             console.log(`URL domain (${currentDomain}) matches Block list. BLOCKING.`);
+            // Log the event
+            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
-        // 5. If not pre-filtered, proceed to AI check
         console.log("URL not in pre-filter lists. Proceeding to AI check.");
-        // Pass the full ruleData object to the AI function
         const decision = await getAIDecision(pageData, ruleData);
+
+        // Log the event
+        await logBlockingEvent({userId, url, decision, reason: 'AI Decision', pageTitle: pageData?.title});
         res.json({ decision: decision });
 
     } catch (err) {
         console.error("Error during pre-filtering or AI check:", err);
+        // Log the error event (userId might be null if getUserRuleData failed, which is fine)
+        await logBlockingEvent({
+            userId: userId, // Pass the userId (even if null)
+            url: url, 
+            decision: 'BLOCK', // Default to BLOCK on error
+            reason: 'Server Error Fallback', 
+            pageTitle: pageData?.title
+        });
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
