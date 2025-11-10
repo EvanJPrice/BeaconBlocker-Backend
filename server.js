@@ -31,6 +31,8 @@ const SYSTEM_ALLOWED_DOMAINS = [
     'onrender.com',       // Allows your backend and frontend
     'supabase.co',        // Allows Supabase API calls
     'accounts.google.com' // Allows the Google Sign-In flow
+    'vercel.app'        // Allows Vercel hosted frontends
+    'beaconblocker.com' // Allows main website
 ];
 
 // --- Helper: getDomainFromUrl ---
