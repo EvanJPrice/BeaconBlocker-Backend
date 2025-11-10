@@ -4,24 +4,22 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const { Resend } = require('resend'); // For uninstall alerts
+// (We have removed Resend)
 
 // --- Setup ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const geminiKey = process.env.GOOGLE_API_KEY; // Make sure this matches your .env
-const resendKey = process.env.RESEND_API_KEY; // Make sure this matches your Render env var
 
-// Check for missing keys
-if (!supabaseUrl || !supabaseKey || !geminiKey || !resendKey) {
-  console.error("❌ ERROR: Missing .env variables! Check SUPABASE_URL, SUPABASE_ANON_KEY, GOOGLE_API_KEY, and RESEND_API_KEY.");
+// Check for missing keys (Resend key check removed)
+if (!supabaseUrl || !supabaseKey || !geminiKey) {
+  console.error("❌ ERROR: Missing .env variables! Check SUPABASE_URL, SUPABASE_ANON_KEY, and GOOGLE_API_KEY.");
   process.exit(1); 
 }
 
-// Initialize clients
+// Initialize clients (Resend client removed)
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
-const resend = new Resend(resendKey);
 const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
 const app = express();
 const port = process.env.PORT || 3000;
@@ -86,7 +84,7 @@ async function getUserRuleData(apiKey) {
     }
     console.log("Fetching rule data for key:", apiKey.substring(0, 5) + "...");
 
-    // Fetch all relevant columns, including user_id and last_seen
+    // Fetches all relevant columns, including user_id and last_seen
     const { data, error } = await supabase
         .from('rules')
         .select('user_id, prompt, api_key, blocked_categories, allow_list, block_list, last_seen')
@@ -107,13 +105,13 @@ async function getUserRuleData(apiKey) {
 
 // --- AI Decision Function ---
 async function getAIDecision(pageData, ruleData) {
-    const { title, description, h1, url, searchQuery } = pageData;
+    const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData; // Added keywords and bodyText
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
-    console.log(`Data for AI: Title='${title || '(empty)'}', Desc='${description || '(empty)'}', H1='${h1 || '(empty)'}', Query='${searchQuery || '(none)'}'`);
+    console.log(`AI Check: Title='${title || '(empty)'}', URL='${url}'`);
 
     let finalPrompt = userMainPrompt || "No prompt provided."; 
-    const BLOCKED_CATEGORY_LABELS = { // Define labels here
+    const BLOCKED_CATEGORY_LABELS = {
         'social': 'Social Media (Facebook, Instagram, TikTok, etc.)',
         'news': 'News & Politics',
         'entertainment': 'Entertainment (Streaming, non-educational YouTube)',
@@ -129,12 +127,16 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
+    // Updated prompt with new data points
     finalPrompt += `\n\nAnalyze the webpage based on the following information:
-    - Title: "${title}"
-    - Description: "${description}"
-    - H1: "${h1}"
     - URL: "${url}"
-    - Search Query that led here (if applicable): "${searchQuery || 'N/A'}"
+    - Title: "${title || 'N/A'}"
+    - H1 Header: "${h1 || 'N/A'}"
+    - Meta Description: "${description || 'N/A'}"
+    - Meta Keywords: "${keywords || 'N/A'}" 
+    - Body Text Snippet: "${bodyText || 'N/A'}" 
+    - Search Query (if any): "${searchQuery || 'N/A'}"
+
     My user's rule details are above.
     **CRITICAL BLOCKING INSTRUCTIONS:**
     1. Prioritize any "Always Block" or "Always Allow" lists provided separately (handled before this call).
@@ -159,7 +161,7 @@ async function getAIDecision(pageData, ruleData) {
         return decision;
     } catch (error) {
         console.error('Error contacting AI:', error.message);
-        return 'BLOCK'; // Default to block on AI error
+        return 'BLOCK';
     }
 }
 
@@ -180,11 +182,11 @@ app.post('/check-url', async (req, res) => {
     try {
         currentDomain = getDomainFromUrl(url); 
         
-        // --- 1. System Allow Check (Dashboard, etc.) ---
+        // --- 1. System Allow Check ---
         if (currentDomain && SYSTEM_ALLOWED_DOMAINS.some(domain => currentDomain.endsWith(domain))) {
             console.log(`System Allow: Allowing ${currentDomain} (dashboard/infra).`);
             try {
-                const ruleData = await getUserRuleData(apiKey); // Fetch rules just to get userId
+                const ruleData = await getUserRuleData(apiKey);
                 userId = ruleData?.user_id;
                 await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
             } catch (logErr) {
@@ -196,12 +198,11 @@ app.post('/check-url', async (req, res) => {
         // --- 2. User-Specific Rule Logic ---
         const ruleData = await getUserRuleData(apiKey);
         if (!ruleData) {
-            // This handles invalid API keys
             await logBlockingEvent({userId: null, url, decision: 'BLOCK', reason: 'Invalid API Key', pageTitle: pageData?.title});
             return res.status(401).json({ error: "Invalid API Key" });
         }
         
-        userId = ruleData.user_id; // Get user ID
+        userId = ruleData.user_id;
         const { allow_list, block_list } = ruleData;
 
         // --- 3. Check User Allow List ---
@@ -250,7 +251,7 @@ app.post('/heartbeat', async (req, res) => {
             if (error) {
                 console.warn("Error updating last_seen:", error.message);
             } else {
-                console.log(`Hearta-beat received for key: ${apiKey.substring(0, 5)}...`);
+                console.log(`Heartbeat received for key: ${apiKey.substring(0, 5)}...`);
             }
         } catch (err) {
             console.error("Error in heartbeat endpoint:", err.message);
@@ -259,54 +260,10 @@ app.post('/heartbeat', async (req, res) => {
     res.status(200).send('OK');
 });
 
-// --- API Endpoint: Uninstall Notification ---
-app.get('/uninstalled', async (req, res) => {
-    const apiKey = req.query.key;
-    const parentEmail = process.env.PARENT_NOTIFICATION_EMAIL; // Your test email from .env
-
-    console.log(`Received uninstall notification for key: ${apiKey ? apiKey.substring(0, 5) : 'UNKNOWN'}...`);
-
-    // !! UPDATE THIS URL to your frontend dashboard URL !!
-    const redirectUrl = 'https://beacon-blocker-dashboard.onrender.com'; // <-- EXAMPLE URL, UPDATE THIS
-
-    if (!apiKey || !parentEmail) {
-        console.error("Missing API key or parent email for uninstall notification.");
-        return res.redirect(redirectUrl);
-    }
-
-    try {
-        const { data: ruleData, error: ruleError } = await supabase
-            .from('rules')
-            .select('user_id')
-            .eq('api_key', apiKey)
-            .single();
-
-        if (ruleError || !ruleData) throw new Error(`Can't find user for API key: ${ruleError?.message}`);
-        
-        // This requires you to enable 'Enable Read Access for Admin API' in Supabase Auth settings
-        // Or using the Service Key to initialize a separate admin client
-        // For simplicity, let's just use the PARENT_NOTIFICATION_EMAIL from .env
-        
-        const alertEmail = process.env.PARENT_NOTIFICATION_EMAIL; 
-
-        await resend.emails.send({
-            from: 'alert@beaconblocker.com', // !! MUST BE FROM YOUR VERIFIED RESEND DOMAIN !!
-            to: alertEmail,
-            subject: 'Beacon Blocker Alert: Extension Uninstalled',
-            html: `<strong>Heads up!</strong><p>The Beacon Blocker extension associated with your account (API Key starting with ${apiKey.substring(0, 5)}) was just uninstalled.</p><p>If this was you, you can ignore this. If this was not, you may need to reinstall the extension on the device.</p>`
-        });
-        console.log(`Successfully sent uninstall email to ${alertEmail}`);
-        
-    } catch (error) {
-        console.error("Error processing uninstall:", error.message);
-    }
-    
-    // Redirect the user to the dashboard
-    res.redirect(redirectUrl);
-});
+// --- (The /uninstalled endpoint has been removed) ---
 
 
-// --- Start the server (THIS IS THE MISSING LINE) ---
+// --- Start the server (THIS IS THE CRITICAL LINE) ---
 app.listen(port, () => {
     console.log(`✅ SERVER IS LIVE (All Features) on port ${port}`);
 });
