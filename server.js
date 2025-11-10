@@ -1,54 +1,69 @@
-// --- Imports (Keep all existing imports) ---
+// --- Imports ---
 require('dotenv').config();
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const { Resend } = require('resend'); // For uninstall alerts
 
-// --- Setup (AI, Supabase, Server - Keep existing) ---
-
-// 1. Read environment variables loaded by dotenv
+// --- Setup ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
-const geminiKey = process.env.GOOGLE_API_KEY;
+const geminiKey = process.env.GOOGLE_API_KEY; // Make sure this matches your .env
+const resendKey = process.env.RESEND_API_KEY; // Make sure this matches your Render env var
 
-// 2. Check if keys are missing (good practice for servers)
-if (!supabaseUrl || !supabaseKey || !geminiKey) {
-  console.error("❌ ERROR: Missing .env variables! Check SUPABASE_URL, SUPABASE_ANON_KEY, and GOOGLE_API_KEY.");
-  // Don't start the server if keys are missing
+// Check for missing keys
+if (!supabaseUrl || !supabaseKey || !geminiKey || !resendKey) {
+  console.error("❌ ERROR: Missing .env variables! Check SUPABASE_URL, SUPABASE_ANON_KEY, GOOGLE_API_KEY, and RESEND_API_KEY.");
   process.exit(1); 
 }
 
-// 3. Initialize your clients (THIS IS THE FIX)
+// Initialize clients
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
-
-// 4. Continue with your existing code
-const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" }); // Or gemini-1.0-pro
+const resend = new Resend(resendKey);
+const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
 const app = express();
+const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
-const port = process.env.PORT || 3000;
 
-// --- Helper: getDomainFromUrl (Keep existing) ---
+// --- System-level domains that are always allowed ---
+const SYSTEM_ALLOWED_DOMAINS = [
+    'onrender.com',       // Allows your backend and frontend
+    'supabase.co',        // Allows Supabase API calls
+    'accounts.google.com' // Allows the Google Sign-In flow
+];
+
+// --- Helper: getDomainFromUrl ---
 function getDomainFromUrl(urlString) {
+    if (!urlString) return null;
     try {
-        const url = new URL(urlString);
+        let fullUrl = urlString.trim();
+        if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) {
+            fullUrl = 'http://' + fullUrl;
+        }
+        const url = new URL(fullUrl);
         const parts = url.hostname.split('.');
-        if (parts.length >= 2) { return parts.slice(-2).join('.').toLowerCase(); }
+        if (parts.length >= 2) {
+            if (parts.length > 2 && parts[parts.length - 2].length <= 3 && parts[parts.length - 1].length <= 3) {
+                 return parts.slice(-3).join('.').toLowerCase(); // e.g., bbc.co.uk
+            }
+            return parts.slice(-2).join('.').toLowerCase(); // e.g., google.com
+        }
         return url.hostname.toLowerCase();
     } catch (e) { console.error("Error extracting domain:", e); return null; }
 }
 
-// Helper function to log blocking events
+// --- Helper: Log Blocking Event ---
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) {
         console.error("Cannot log event: userId is missing.");
-        return; // Don't try to log if we don't know who it's for
+        return;
     }
     try {
-        const domain = getDomainFromUrl(url); // Use your existing helper
+        const domain = getDomainFromUrl(url);
         const { error } = await supabase.from('blocking_log').insert({
             user_id: userId,
             url: url || 'Unknown URL',
@@ -57,57 +72,48 @@ async function logBlockingEvent(logData) {
             reason: reason,
             page_title: pageTitle || ''
         });
-        if (error) {
-            console.error("Error logging event:", error.message);
-        }
+        if (error) console.error("Error logging event:", error.message);
     } catch (err) {
         console.error("Exception during logging:", err.message);
     }
 }
 
-// --- UPDATED: Database Function - Fetches Structured Rule ---
+// --- Database Function: Fetches User Rule (Updated) ---
 async function getUserRuleData(apiKey) {
     if (!apiKey) {
         console.error("❌ No API key provided.");
-        // Return default structured data on failure
-        return { prompt: "Block social media and news.", allow_list: [], block_list: [], blocked_categories: {} };
+        return null;
     }
     console.log("Fetching rule data for key:", apiKey.substring(0, 5) + "...");
 
-    // Fetch all the relevant columns now
+    // Fetch all relevant columns, including user_id and last_seen
     const { data, error } = await supabase
         .from('rules')
-        .select('user_id, prompt, allow_list, block_list, blocked_categories') // Select new columns
+        .select('user_id, prompt, api_key, blocked_categories, allow_list, block_list, last_seen')
         .eq('api_key', apiKey)
-        .single(); // Use .single() now that we know the key exists
+        .single();
 
     if (error || !data) {
-        // Log the specific error if it happens again
         console.error("❌ Error fetching rule data or key not found:", error?.message);
-        // Return default structured data on failure
-        return { prompt: "Block social media and news.", allow_list: [], block_list: [], blocked_categories: {} };
+        return null; // Return null on failure
     }
 
     console.log("✅ Successfully fetched rule data!");
-    // Ensure lists are arrays even if DB returns null
     data.allow_list = data.allow_list || [];
     data.block_list = data.block_list || [];
     data.blocked_categories = data.blocked_categories || {};
     return data; // Return the whole data object
 }
 
-// --- AI Decision Function (UPDATED - accepts structured ruleData) ---
+// --- AI Decision Function ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery } = pageData;
-    const { prompt: userMainPrompt, blocked_categories } = ruleData; // Extract raw data
+    const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
-    console.log(`AI Check: Title='${title || '(empty)'}', URL='${url}'`);
+    console.log(`Data for AI: Title='${title || '(empty)'}', Desc='${description || '(empty)'}', H1='${h1 || '(empty)'}', Query='${searchQuery || '(none)'}'`);
 
-    // --- NEW: Construct a structured, unambiguous prompt ---
-
-    // 1. Get the labels of the toggled categories
-    // (We need to define BLOCKED_CATEGORIES here, or just use the keys)
-    const BLOCKED_CATEGORY_LABELS = {
+    let finalPrompt = userMainPrompt || "No prompt provided."; 
+    const BLOCKED_CATEGORY_LABELS = { // Define labels here
         'social': 'Social Media (Facebook, Instagram, TikTok, etc.)',
         'news': 'News & Politics',
         'entertainment': 'Entertainment (Streaming, non-educational YouTube)',
@@ -115,62 +121,49 @@ async function getAIDecision(pageData, ruleData) {
         'shopping': 'Online Shopping (General)',
         'mature': 'Mature Content (Violence, Adult Themes, etc.)'
     };
-
     const selectedCategoryLabels = Object.entries(blocked_categories || {})
         .filter(([, value]) => value === true)
-        .map(([key]) => BLOCKED_CATEGORY_LABELS[key] || key); // Get the full label
+        .map(([key]) => BLOCKED_CATEGORY_LABELS[key] || key); 
 
-    // 2. Build the final prompt
-    let finalPrompt = `You are an AI web filter. Your goal is to help a user focus or stay safe.
-The user has already set "Always Allow" and "Always Block" lists. This URL was NOT on those lists.
-Your job is to decide if this page should be blocked based on the user's general policy.
+    if (selectedCategoryLabels.length > 0) {
+        finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
+    }
 
----
-**User's General Policy (Main Prompt):**
-"${userMainPrompt || 'No general policy provided. Rely on the blocked categories.'}"
-
----
-**User's Pre-set Categories to Block:**
-${selectedCategoryLabels.length > 0 ? selectedCategoryLabels.map(label => `- ${label}`).join('\n') : 'No specific categories are pre-blocked.'}
-
----
-**Webpage to Analyze:**
-- URL: "${url}"
-- Title: "${title || 'N/A'}"
-- H1 Header: "${h1 || 'N/A'}"
-- Description: "${description || 'N/A'}"
-- Search Query (if any): "${searchQuery || 'N/A'}"
-
----
-**Your Decision:**
-Based on the user's policy and pre-set categories, should this page be BLOCKED or ALLOWED?
-Respond with *only* the single word: ALLOW or BLOCK
-`;
-    // --- End of new prompt construction ---
+    finalPrompt += `\n\nAnalyze the webpage based on the following information:
+    - Title: "${title}"
+    - Description: "${description}"
+    - H1: "${h1}"
+    - URL: "${url}"
+    - Search Query that led here (if applicable): "${searchQuery || 'N/A'}"
+    My user's rule details are above.
+    **CRITICAL BLOCKING INSTRUCTIONS:**
+    1. Prioritize any "Always Block" or "Always Allow" lists provided separately (handled before this call).
+    2. Strictly follow the "Explicitly Blocked Categories" if listed.
+    3. Use the main user rule text for overall guidance and nuance.
+    4. Respond with *only* ALLOW or BLOCK. Be decisive.
+    `;
 
     try {
         const result = await model.generateContent(finalPrompt);
         const response = await result.response;
         let decision = response.text().trim().toUpperCase();
-        
         if (decision.includes('BLOCK')) {
             decision = 'BLOCK';
         } else if (decision.includes('ALLOW')) {
             decision = 'ALLOW';
         } else {
-            console.warn('AI gave unclear answer:', response.text(), '. Defaulting to ALLOW.');
-            decision = 'ALLOW'; // Default to ALLOW for edge cases to be less disruptive
+            console.warn('AI gave unclear answer:', response.text(), '. Defaulting to BLOCK.');
+            decision = 'BLOCK';
         }
-
         console.log(`AI decision for ${url} is: ${decision}`);
         return decision;
     } catch (error) {
         console.error('Error contacting AI:', error.message);
-        // Default to ALLOW to avoid over-blocking on AI errors
-        return 'ALLOW';
+        return 'BLOCK'; // Default to block on AI error
     }
 }
 
+// --- API Endpoint: Check URL ---
 app.post('/check-url', async (req, res) => {
     const pageData = req.body;
     const url = pageData?.url;
@@ -178,52 +171,65 @@ app.post('/check-url', async (req, res) => {
     const apiKey = authHeader ? authHeader.split(' ')[1] : null;
 
     if (!url || !apiKey) {
-        // Don't log here, as we don't have a user
         return res.status(400).json({ error: 'Missing URL or API Key' });
     }
 
-    let userId = null; // Variable to hold the user ID
+    let userId = null;
+    let currentDomain = null;
 
     try {
+        currentDomain = getDomainFromUrl(url); 
+        
+        // --- 1. System Allow Check (Dashboard, etc.) ---
+        if (currentDomain && SYSTEM_ALLOWED_DOMAINS.some(domain => currentDomain.endsWith(domain))) {
+            console.log(`System Allow: Allowing ${currentDomain} (dashboard/infra).`);
+            try {
+                const ruleData = await getUserRuleData(apiKey); // Fetch rules just to get userId
+                userId = ruleData?.user_id;
+                await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
+            } catch (logErr) {
+                console.error("Error logging system allow:", logErr.message);
+            }
+            return res.json({ decision: 'ALLOW' });
+        }
+        
+        // --- 2. User-Specific Rule Logic ---
         const ruleData = await getUserRuleData(apiKey);
-
-        // We now have the user_id from the ruleData!
-        userId = ruleData?.user_id; 
-
-        // 2. Get the current domain
+        if (!ruleData) {
+            // This handles invalid API keys
+            await logBlockingEvent({userId: null, url, decision: 'BLOCK', reason: 'Invalid API Key', pageTitle: pageData?.title});
+            return res.status(401).json({ error: "Invalid API Key" });
+        }
+        
+        userId = ruleData.user_id; // Get user ID
         const { allow_list, block_list } = ruleData;
-        const currentDomain = getDomainFromUrl(url);
 
-        // 3. Check Allow List (using array includes/endsWith)
+        // --- 3. Check User Allow List ---
         if (currentDomain && allow_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
             console.log(`URL domain (${currentDomain}) matches Allow list. ALLOWING.`);
-            // Log the event
             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
-        // 4. Check Block List (using array includes/endsWith)
+        // --- 4. Check User Block List ---
         if (currentDomain && block_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
             console.log(`URL domain (${currentDomain}) matches Block list. BLOCKING.`);
-            // Log the event
             await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
+        // --- 5. AI Check ---
         console.log("URL not in pre-filter lists. Proceeding to AI check.");
         const decision = await getAIDecision(pageData, ruleData);
-
-        // Log the event
         await logBlockingEvent({userId, url, decision, reason: 'AI Decision', pageTitle: pageData?.title});
         res.json({ decision: decision });
 
     } catch (err) {
-        console.error("Error during pre-filtering or AI check:", err);
-        // Log the error event (userId might be null if getUserRuleData failed, which is fine)
+        console.error("Error during pre-filtering or AI check:", err.message);
         await logBlockingEvent({
-            userId: userId, // Pass the userId (even if null)
+            userId: userId, 
             url: url, 
-            decision: 'BLOCK', // Default to BLOCK on error
+            decision: 'BLOCK', 
             reason: 'Server Error Fallback', 
             pageTitle: pageData?.title
         });
@@ -231,7 +237,76 @@ app.post('/check-url', async (req, res) => {
     }
 });
 
-// --- Start the server (Unchanged) ---
+// --- API Endpoint: Heartbeat ---
+app.post('/heartbeat', async (req, res) => {
+    const apiKey = req.query.key;
+    if (apiKey) {
+        try {
+            const { error } = await supabase
+                .from('rules')
+                .update({ last_seen: new Date().toISOString() })
+                .eq('api_key', apiKey);
+            
+            if (error) {
+                console.warn("Error updating last_seen:", error.message);
+            } else {
+                console.log(`Hearta-beat received for key: ${apiKey.substring(0, 5)}...`);
+            }
+        } catch (err) {
+            console.error("Error in heartbeat endpoint:", err.message);
+        }
+    }
+    res.status(200).send('OK');
+});
+
+// --- API Endpoint: Uninstall Notification ---
+app.get('/uninstalled', async (req, res) => {
+    const apiKey = req.query.key;
+    const parentEmail = process.env.PARENT_NOTIFICATION_EMAIL; // Your test email from .env
+
+    console.log(`Received uninstall notification for key: ${apiKey ? apiKey.substring(0, 5) : 'UNKNOWN'}...`);
+
+    // !! UPDATE THIS URL to your frontend dashboard URL !!
+    const redirectUrl = 'https://beacon-blocker-dashboard.onrender.com'; // <-- EXAMPLE URL, UPDATE THIS
+
+    if (!apiKey || !parentEmail) {
+        console.error("Missing API key or parent email for uninstall notification.");
+        return res.redirect(redirectUrl);
+    }
+
+    try {
+        const { data: ruleData, error: ruleError } = await supabase
+            .from('rules')
+            .select('user_id')
+            .eq('api_key', apiKey)
+            .single();
+
+        if (ruleError || !ruleData) throw new Error(`Can't find user for API key: ${ruleError?.message}`);
+        
+        // This requires you to enable 'Enable Read Access for Admin API' in Supabase Auth settings
+        // Or using the Service Key to initialize a separate admin client
+        // For simplicity, let's just use the PARENT_NOTIFICATION_EMAIL from .env
+        
+        const alertEmail = process.env.PARENT_NOTIFICATION_EMAIL; 
+
+        await resend.emails.send({
+            from: 'alert@beaconblocker.com', // !! MUST BE FROM YOUR VERIFIED RESEND DOMAIN !!
+            to: alertEmail,
+            subject: 'Beacon Blocker Alert: Extension Uninstalled',
+            html: `<strong>Heads up!</strong><p>The Beacon Blocker extension associated with your account (API Key starting with ${apiKey.substring(0, 5)}) was just uninstalled.</p><p>If this was you, you can ignore this. If this was not, you may need to reinstall the extension on the device.</p>`
+        });
+        console.log(`Successfully sent uninstall email to ${alertEmail}`);
+        
+    } catch (error) {
+        console.error("Error processing uninstall:", error.message);
+    }
+    
+    // Redirect the user to the dashboard
+    res.redirect(redirectUrl);
+});
+
+
+// --- Start the server (THIS IS THE MISSING LINE) ---
 app.listen(port, () => {
-    console.log(`✅ SERVER IS LIVE (Structured Rules) on port ${port}`);
+    console.log(`✅ SERVER IS LIVE (All Features) on port ${port}`);
 });
