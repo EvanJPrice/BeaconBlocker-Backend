@@ -179,14 +179,27 @@ app.post('/check-url', async (req, res) => {
     }
 
     let userId = null;
-    let currentDomain = null;
+    let currentDomain = null; // This is the BASE domain
+    let fullHostname = null;  // This is the FULL hostname
 
     try {
-        currentDomain = getDomainFromUrl(url); 
-        
-        // --- 1. System Allow Check ---
-        if (currentDomain && SYSTEM_ALLOWED_DOMAINS.some(domain => currentDomain.endsWith(domain))) {
-            console.log(`System Allow: Allowing ${currentDomain} (dashboard/infra).`);
+        // --- NEW: Extract FULL hostname first ---
+        try {
+            let fullUrl = url.trim();
+            if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) {
+                fullUrl = 'http://' + fullUrl;
+            }
+            fullHostname = new URL(fullUrl).hostname.toLowerCase();
+        } catch (e) {
+            console.error("Error extracting full hostname:", e);
+            fullHostname = null;
+        }
+
+        // --- 1. System Allow Check (MODIFIED) ---
+        // We check the FULL hostname against the list.
+        // This correctly handles both '...vercel.app' and 'accounts.google.com'
+        if (fullHostname && SYSTEM_ALLOWED_DOMAINS.some(domain => fullHostname === domain || fullHostname.endsWith('.' + domain))) {
+            console.log(`System Allow: Allowing ${fullHostname} (dashboard/infra).`);
             try {
                 const ruleData = await getUserRuleData(apiKey);
                 userId = ruleData?.user_id;
@@ -197,7 +210,9 @@ app.post('/check-url', async (req, res) => {
             return res.json({ decision: 'ALLOW' });
         }
         
-        // --- 2. User-Specific Rule Logic ---
+        // --- 2. User-Specific Rule Logic (Get BASE domain) ---
+        // NOW we get the base domain for the user's custom lists
+        currentDomain = getDomainFromUrl(url); 
         const ruleData = await getUserRuleData(apiKey);
         if (!ruleData) {
             await logBlockingEvent({userId: null, url, decision: 'BLOCK', reason: 'Invalid API Key', pageTitle: pageData?.title});
