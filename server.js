@@ -6,7 +6,7 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 // (We have removed Resend)
 
-console.log(`✅ SERVER IS LIVE (All Features) on port ${port}`); // <-- THIS IS THE NEW LINE
+console.log("✅ SERVER.JS SCRIPT STARTED - v2 (Search Fix Included)"); // <-- THIS IS THE NEW, SAFE LOG
 
 // --- Setup ---
 const supabaseUrl = process.env.SUPABASE_URL;
