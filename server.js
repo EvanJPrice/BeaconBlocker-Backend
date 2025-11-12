@@ -6,6 +6,8 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 // (We have removed Resend)
 
+console.log(`✅ SERVER IS LIVE (All Features) on port ${port}`); // <-- THIS IS THE NEW LINE
+
 // --- Setup ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
@@ -221,6 +223,14 @@ app.post('/check-url', async (req, res) => {
         
         userId = ruleData.user_id;
         const { allow_list, block_list } = ruleData;
+
+        // --- !! NEW SEARCH QUERY FIX !! ---
+        // Check if the pageData contains a search query
+        if (pageData.searchQuery) {
+            console.log(`Search query detected: '${pageData.searchQuery}'. Allowing and logging.`);
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Query', pageTitle: pageData?.title});
+            return res.json({ decision: 'ALLOW' });
+        }
 
         // --- 3. Check User Allow List ---
         if (currentDomain && allow_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
