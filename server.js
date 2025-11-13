@@ -4,22 +4,17 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-// (We have removed Resend)
-
-console.log("✅ SERVER.JS SCRIPT STARTED - v2 (Search Fix Included)"); // <-- THIS IS THE NEW, SAFE LOG
 
 // --- Setup ---
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
-const geminiKey = process.env.GOOGLE_API_KEY; // Make sure this matches your .env
+const geminiKey = process.env.GOOGLE_API_KEY;
 
-// Check for missing keys (Resend key check removed)
 if (!supabaseUrl || !supabaseKey || !geminiKey) {
   console.error("❌ ERROR: Missing .env variables! Check SUPABASE_URL, SUPABASE_ANON_KEY, and GOOGLE_API_KEY.");
   process.exit(1); 
 }
 
-// Initialize clients (Resend client removed)
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
 const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
@@ -28,13 +23,14 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// --- System-level domains that are always allowed ---
+// --- 1. INFRASTRUCTURE ALLOW LIST ---
+// These domains are essential for the app to work and are ALWAYS allowed.
 const SYSTEM_ALLOWED_DOMAINS = [
     'onrender.com',       // Allows your backend and frontend
     'supabase.co',        // Allows Supabase API calls
-    'accounts.google.com', // Allows the Google Sign-In flow
-    'vercel.app',        // Allows Vercel hosted frontends
-    'beaconblocker.com'  // Allows main website
+    'accounts.google.com',// Allows the Google Sign-In flow
+    'beaconblocker.com',  // Your custom domain
+    'vercel.app'          // Dashboard hosting
 ];
 
 // --- Helper: getDomainFromUrl ---
@@ -49,9 +45,9 @@ function getDomainFromUrl(urlString) {
         const parts = url.hostname.split('.');
         if (parts.length >= 2) {
             if (parts.length > 2 && parts[parts.length - 2].length <= 3 && parts[parts.length - 1].length <= 3) {
-                 return parts.slice(-3).join('.').toLowerCase(); // e.g., bbc.co.uk
+                 return parts.slice(-3).join('.').toLowerCase();
             }
-            return parts.slice(-2).join('.').toLowerCase(); // e.g., google.com
+            return parts.slice(-2).join('.').toLowerCase();
         }
         return url.hostname.toLowerCase();
     } catch (e) { console.error("Error extracting domain:", e); return null; }
@@ -60,10 +56,13 @@ function getDomainFromUrl(urlString) {
 // --- Helper: Log Blocking Event ---
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
-    if (!userId) {
-        console.error("Cannot log event: userId is missing.");
-        return;
+    if (!userId) return; 
+    
+    // Skip logging "System Rule" events to keep the feed clean
+    if (reason && reason.startsWith('System Rule')) {
+        return; 
     }
+
     try {
         const domain = getDomainFromUrl(url);
         const { error } = await supabase.from('blocking_log').insert({
@@ -80,15 +79,10 @@ async function logBlockingEvent(logData) {
     }
 }
 
-// --- Database Function: Fetches User Rule (Updated) ---
+// --- Database Function: Fetches User Rule ---
 async function getUserRuleData(apiKey) {
-    if (!apiKey) {
-        console.error("❌ No API key provided.");
-        return null;
-    }
-    console.log("Fetching rule data for key:", apiKey.substring(0, 5) + "...");
-
-    // Fetches all relevant columns, including user_id and last_seen
+    if (!apiKey) return null;
+    
     const { data, error } = await supabase
         .from('rules')
         .select('user_id, prompt, api_key, blocked_categories, allow_list, block_list, last_seen')
@@ -96,20 +90,19 @@ async function getUserRuleData(apiKey) {
         .single();
 
     if (error || !data) {
-        console.error("❌ Error fetching rule data or key not found:", error?.message);
-        return null; // Return null on failure
+        console.error("Error fetching rule:", error?.message);
+        return null;
     }
 
-    console.log("✅ Successfully fetched rule data!");
     data.allow_list = data.allow_list || [];
     data.block_list = data.block_list || [];
     data.blocked_categories = data.blocked_categories || {};
-    return data; // Return the whole data object
+    return data;
 }
 
 // --- AI Decision Function ---
 async function getAIDecision(pageData, ruleData) {
-    const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData; // Added keywords and bodyText
+    const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
     console.log(`AI Check: Title='${title || '(empty)'}', URL='${url}'`);
@@ -131,7 +124,6 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
-    // Updated prompt with new data points
     finalPrompt += `\n\nAnalyze the webpage based on the following information:
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
@@ -139,30 +131,25 @@ async function getAIDecision(pageData, ruleData) {
     - Meta Description: "${description || 'N/A'}"
     - Meta Keywords: "${keywords || 'N/A'}" 
     - Body Text Snippet: "${bodyText || 'N/A'}" 
-    - Search Query (if any): "${searchQuery || 'N/A'}"
+    - Search Query (context only): "${searchQuery || 'N/A'}"
 
     My user's rule details are above.
     **CRITICAL BLOCKING INSTRUCTIONS:**
-    1. Prioritize any "Always Block" or "Always Allow" lists provided separately (handled before this call).
-    2. Strictly follow the "Explicitly Blocked Categories" if listed.
-    3. Use the main user rule text for overall guidance and nuance.
-    4. Respond with *only* ALLOW or BLOCK. Be decisive.
+    1. Prioritize any "Always Block" or "Always Allow" lists provided separately.
+    2. Strictly follow the "Explicitly Blocked Categories".
+    3. Use the main user rule text for overall guidance.
+    4. Respond with *only* ALLOW or BLOCK.
     `;
 
     try {
         const result = await model.generateContent(finalPrompt);
         const response = await result.response;
         let decision = response.text().trim().toUpperCase();
-        if (decision.includes('BLOCK')) {
-            decision = 'BLOCK';
-        } else if (decision.includes('ALLOW')) {
-            decision = 'ALLOW';
-        } else {
-            console.warn('AI gave unclear answer:', response.text(), '. Defaulting to BLOCK.');
-            decision = 'BLOCK';
-        }
-        console.log(`AI decision for ${url} is: ${decision}`);
-        return decision;
+        
+        if (decision.includes('BLOCK')) return 'BLOCK';
+        if (decision.includes('ALLOW')) return 'ALLOW';
+        
+        return 'BLOCK'; // Default safety
     } catch (error) {
         console.error('Error contacting AI:', error.message);
         return 'BLOCK';
@@ -181,86 +168,67 @@ app.post('/check-url', async (req, res) => {
     }
 
     let userId = null;
-    let currentDomain = null; // This is the BASE domain
-    let fullHostname = null;  // This is the FULL hostname
 
     try {
-        // --- NEW: Extract FULL hostname first ---
-        try {
-            let fullUrl = url.trim();
-            if (!fullUrl.startsWith('http://') && !fullUrl.startsWith('https://')) {
-                fullUrl = 'http://' + fullUrl;
-            }
-            fullHostname = new URL(fullUrl).hostname.toLowerCase();
-        } catch (e) {
-            console.error("Error extracting full hostname:", e);
-            fullHostname = null;
+        // --- 1. SMART ALLOWS (Save Tokens & Protect Infra) ---
+        const urlObj = new URL(url);
+        const hostname = urlObj.hostname.toLowerCase();
+        const pathname = urlObj.pathname;
+        const baseDomain = getDomainFromUrl(url);
+
+        // A. Dashboard & Infrastructure
+        if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
+             console.log(`System Allow: Infra (${baseDomain})`);
+             return res.json({ decision: 'ALLOW' });
         }
 
-        // --- 1. System Allow Check (MODIFIED) ---
-        // We check the FULL hostname against the list.
-        // This correctly handles both '...vercel.app' and 'accounts.google.com'
-        if (fullHostname && SYSTEM_ALLOWED_DOMAINS.some(domain => fullHostname === domain || fullHostname.endsWith('.' + domain))) {
-            console.log(`System Allow: Allowing ${fullHostname} (dashboard/infra).`);
-            try {
-                const ruleData = await getUserRuleData(apiKey);
-                userId = ruleData?.user_id;
-                await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
-            } catch (logErr) {
-                console.error("Error logging system allow:", logErr.message);
-            }
-            return res.json({ decision: 'ALLOW' });
+        // B. Search Engines (Google, Bing, etc.) - Home & Results
+        // Allows "google.com" (home) and "google.com/search?q=..."
+        if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
+            && (pathname === '/' || pathname.startsWith('/search'))) {
+             console.log("System Allow: Search Engine");
+             return res.json({ decision: 'ALLOW' });
+        }
+
+        // C. YouTube (Home & Search only) - Video pages (/watch) will still go to AI
+        if (hostname.endsWith('youtube.com') && (pathname === '/' || pathname.startsWith('/results'))) {
+             console.log("System Allow: YouTube Home/Search");
+             return res.json({ decision: 'ALLOW' });
         }
         
-        // --- 2. User-Specific Rule Logic (Get BASE domain) ---
-        // NOW we get the base domain for the user's custom lists
-        currentDomain = getDomainFromUrl(url); 
+        // --- 2. Fetch User Rules ---
         const ruleData = await getUserRuleData(apiKey);
         if (!ruleData) {
-            await logBlockingEvent({userId: null, url, decision: 'BLOCK', reason: 'Invalid API Key', pageTitle: pageData?.title});
             return res.status(401).json({ error: "Invalid API Key" });
         }
         
         userId = ruleData.user_id;
         const { allow_list, block_list } = ruleData;
 
-        // --- !! NEW SEARCH QUERY FIX !! ---
-        // Check if the pageData contains a search query
-        if (pageData.searchQuery) {
-            console.log(`Search query detected: '${pageData.searchQuery}'. Allowing and logging.`);
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Query', pageTitle: pageData?.title});
-            return res.json({ decision: 'ALLOW' });
-        }
-
-        // --- 3. Check User Allow List ---
-        if (currentDomain && allow_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
-            console.log(`URL domain (${currentDomain}) matches Allow list. ALLOWING.`);
+        // --- 3. User Allow List ---
+        if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
+            console.log(`User Allow: ${baseDomain}`);
             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
-        // --- 4. Check User Block List ---
-        if (currentDomain && block_list.some(domain => currentDomain === domain || currentDomain.endsWith('.' + domain))) {
-            console.log(`URL domain (${currentDomain}) matches Block list. BLOCKING.`);
+        // --- 4. User Block List ---
+        if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
+            console.log(`User Block: ${baseDomain}`);
             await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
         // --- 5. AI Check ---
-        console.log("URL not in pre-filter lists. Proceeding to AI check.");
+        console.log("AI Check for:", url);
         const decision = await getAIDecision(pageData, ruleData);
         await logBlockingEvent({userId, url, decision, reason: 'AI Decision', pageTitle: pageData?.title});
         res.json({ decision: decision });
 
     } catch (err) {
-        console.error("Error during pre-filtering or AI check:", err.message);
-        await logBlockingEvent({
-            userId: userId, 
-            url: url, 
-            decision: 'BLOCK', 
-            reason: 'Server Error Fallback', 
-            pageTitle: pageData?.title
-        });
+        console.error("Error in check-url:", err.message);
+        // Fail closed (BLOCK) to prevent bypass
+        await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Server Error', pageTitle: pageData?.title});
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
@@ -270,27 +238,16 @@ app.post('/heartbeat', async (req, res) => {
     const apiKey = req.query.key;
     if (apiKey) {
         try {
-            const { error } = await supabase
+            await supabase
                 .from('rules')
                 .update({ last_seen: new Date().toISOString() })
                 .eq('api_key', apiKey);
-            
-            if (error) {
-                console.warn("Error updating last_seen:", error.message);
-            } else {
-                console.log(`Heartbeat received for key: ${apiKey.substring(0, 5)}...`);
-            }
-        } catch (err) {
-            console.error("Error in heartbeat endpoint:", err.message);
-        }
+        } catch (err) { /* ignore heartbeat errors */ }
     }
     res.status(200).send('OK');
 });
 
-// --- (The /uninstalled endpoint has been removed) ---
-
-
-// --- Start the server (THIS IS THE CRITICAL LINE) ---
+// --- Start Server ---
 app.listen(port, () => {
-    console.log(`✅ SERVER IS LIVE (All Features) on port ${port}`);
+    console.log(`✅ SERVER IS LIVE on port ${port}`);
 });
