@@ -1,5 +1,5 @@
 // FILE: server.js
-// VERSION: v5.1 (Strict Category Definitions)
+// VERSION: v5.3 (Nuanced Prompt + Silent System Rules)
 
 // --- Imports ---
 require('dotenv').config();
@@ -59,7 +59,13 @@ async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) return; 
     
-    if (reason && reason.startsWith('System Rule (Infra)')) return; 
+    // Only skip strictly internal infrastructure logs
+    // (Search Allowed and YT Navigation are now logged again per v5.3 requirement?)
+    // Wait - you asked for SILENT System Rules in v5.3 description ("hiding search noise").
+    // So we keep this check strict:
+    if (reason && (reason.startsWith('System Rule') || reason === 'Search Allowed' || reason === 'YouTube Navigation')) {
+        return; 
+    }
 
     try {
         const domain = getDomainFromUrl(url);
@@ -90,7 +96,7 @@ async function getUserRuleData(apiKey) {
     return data;
 }
 
-// --- AI Decision Function (v5.1 - Clearer Definitions) ---
+// --- AI Decision Function (v5.1 Logic - Clear Nuance) ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
@@ -121,7 +127,7 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
-    // --- UPDATED PROMPT INSTRUCTIONS V5.1 ---
+    // --- NUANCED PROMPT ---
     finalPrompt += `\n\nAnalyze this webpage:
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
@@ -135,7 +141,7 @@ async function getAIDecision(pageData, ruleData) {
     1. **User's Main Prompt:** Highest priority. If they explicitly allow a topic, ALLOW it.
     2. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
     3. **Category Definitions (Strict):**
-       - **"Games":** Refers ONLY to **interactive gameplay** (browser games, cloud gaming sites). It does **NOT** include videos about games (reviews, news, walkthroughs).
+       - **"Games":** Refers ONLY to **interactive gameplay** (browser games, cloud gaming). It does **NOT** include videos about games (reviews, news, walkthroughs).
        - **"Entertainment":** Refers to **passive watching**. This INCLUDES gameplay videos (Let's Plays), streams, movies, and viral clips.
        - **"Shopping":** Refers ONLY to **transactional pages** (storefronts, checkout). It does **NOT** include product reviews or unboxings.
     4. **General:** Respond with *only* ALLOW or BLOCK.
@@ -178,37 +184,30 @@ app.post('/check-url', async (req, res) => {
 
         // 1. Infrastructure (Hidden)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
-             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
+             // SILENT ALLOW
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 2. Search Engines (Logged)
+        // 2. Search Engines (Hidden)
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
-             
-             let engine = "Search Engine";
-             if (hostname.includes('google')) engine = "Google";
-             else if (hostname.includes('bing')) engine = "Bing";
-             const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
-             
-             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Allowed', pageTitle: displayTitle});
+             console.log("System Allow: Search Engine (Silent)");
+             // SILENT ALLOW
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 3. YouTube Browsing (Logged)
+        // 3. YouTube Browsing (Hidden)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
-                 
-                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Navigation";
-
-                 await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: displayTitle});
+                 console.log("System Allow: YouTube Browsing (Silent)");
+                 // SILENT ALLOW
                  return res.json({ decision: 'ALLOW' });
             }
         }
         
         // 4. User Lists
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
@@ -217,7 +216,7 @@ app.post('/check-url', async (req, res) => {
             return res.json({ decision: 'BLOCK' });
         }
 
-        // 5. AI Check
+        // 5. AI Check (The ONLY place Search Query appears in logs)
         console.log("Proceeding to AI Check...");
         const decision = await getAIDecision(pageData, ruleData);
         
