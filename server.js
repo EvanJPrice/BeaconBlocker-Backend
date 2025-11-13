@@ -1,5 +1,7 @@
 // FILE: server.js
-// VERSION: v4.1 (Explicit Log Suppression for Search/Nav)
+// VERSION: v4.2 (Matching Search Queries, Improved Log Suppression)
+// DESCRIPTION: Express server for content filtering using Google Gemini AI and Supabase.
+//              Improved to guarantee ALLOW on search query matches and suppress certain log entries.
 
 // --- Imports ---
 require('dotenv').config();
@@ -99,12 +101,26 @@ async function getUserRuleData(apiKey) {
     return data;
 }
 
-// --- AI Decision Function ---
+// --- AI Decision Function (v4 - Search Match Guarantee) ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
     console.log(`AI Input: Title='${title}'`);
+
+    // --- 1. PRE-CHECK: EXACT SEARCH MATCH ---
+    // If the search query is very similar to the video title, ALLOW immediately.
+    // This fixes the "Octopus Piano" issue where specific intent was ignored.
+    if (searchQuery && title) {
+        const cleanSearch = searchQuery.toLowerCase().trim();
+        const cleanTitle = title.toLowerCase().trim();
+        
+        // If the title contains the search query (or vice versa), it's a match.
+        if (cleanTitle.includes(cleanSearch) || cleanSearch.includes(cleanTitle)) {
+            console.log(`Auto-Allow: Search '${cleanSearch}' matches title.`);
+            return 'ALLOW';
+        }
+    }
 
     let finalPrompt = userMainPrompt || "No prompt provided."; 
     const BLOCKED_CATEGORY_LABELS = {
@@ -129,10 +145,13 @@ async function getAIDecision(pageData, ruleData) {
     - Search Query (Context): "${searchQuery || 'N/A'}"
 
     My user's rule details are above.
-    **CRITICAL INSTRUCTIONS (In Order of Priority):**
-    1. **User's Main Prompt:** Highest priority. If the user explicitly allows a specific topic/site, ALLOW it.
-    2. **Blocked Categories:** If the page fits a blocked category (and is NOT exempted by the Prompt), BLOCK it.
-    3. **Search Context:** If the Search Query strongly matches the page content, treat this as productive intent (lean ALLOW).
+    **CRITICAL INSTRUCTIONS:**
+    1. **User's Main Prompt:** Highest priority. If they say "Allow YouTube", accept it regardless of category.
+    2. **Search Context:** If the Search Query matches the content topic, ALLOW it.
+    3. **Context Nuance:**
+       - **"Games":** Block gameplay. ALLOW reviews, news, analysis.
+       - **"Shopping":** Block stores. ALLOW reviews/unboxing.
+       - **"Entertainment":** Block mindless streaming. ALLOW creative projects, skill-building, and educational content.
     4. **General:** Respond with *only* ALLOW or BLOCK.
     `;
 
