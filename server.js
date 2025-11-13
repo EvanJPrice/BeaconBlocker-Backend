@@ -177,40 +177,38 @@ app.post('/check-url', async (req, res) => {
         const pathname = urlObj.pathname;
         const baseDomain = getDomainFromUrl(url);
 
-        // A. Dashboard & Infrastructure
+        // A. Dashboard & Infrastructure (Hidden from logs)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
              console.log(`System Allow: Infra (${baseDomain})`);
-             // Note: reason 'System Rule (Infra)' will be SKIPPED by the log function
+             // We keep this reason starting with "System Rule (Infra)" so it stays HIDDEN from the feed
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // --- 2. Fetch User Rules (Moved Up to get userId) ---
-        const ruleData = await getUserRuleData(apiKey);
-        if (!ruleData) {
-            return res.status(401).json({ error: "Invalid API Key" });
-        }
-        userId = ruleData.user_id;
-        const { allow_list, block_list } = ruleData;
-
-        // --- 3. SEARCH ENGINE ALLOWS (Updated to Log!) ---
+        // B. Search Engines (Home & Results only)
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
              
-             const displayTitle = pageData.searchQuery ? `Search: "${pageData.searchQuery}"` : "Search Engine Home";
+             // Detect the Engine Name
+             let engine = "Search Engine";
+             if (hostname.includes('google')) engine = "Google";
+             else if (hostname.includes('bing')) engine = "Bing";
+             else if (hostname.includes('duckduckgo')) engine = "DuckDuckGo";
+
+             const displayTitle = pageData.searchQuery ? `${engine}: "${pageData.searchQuery}"` : `${engine} Home`;
              console.log(`System Allow: ${displayTitle}`);
              
              await logBlockingEvent({
                  userId, 
                  url, 
                  decision: 'ALLOW', 
-                 reason: 'System Rule (Search)', 
+                 reason: 'Search Allowed', // <--- Much cleaner reason
                  pageTitle: displayTitle 
              });
              return res.json({ decision: 'ALLOW' });
         }
 
-        // --- 4. YOUTUBE BROWSING ALLOWS (Updated to Log!) ---
+        // C. YouTube (Home & Search only)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
                  
@@ -221,27 +219,37 @@ app.post('/check-url', async (req, res) => {
                      userId, 
                      url, 
                      decision: 'ALLOW', 
-                     reason: 'System Rule (YT)', 
+                     reason: 'YouTube Navigation', // <--- Much cleaner reason
                      pageTitle: displayTitle
                  });
                  return res.json({ decision: 'ALLOW' });
             }
         }
+        
+        // --- 2. Fetch User Rules ---
+        const ruleData = await getUserRuleData(apiKey);
+        if (!ruleData) {
+            return res.status(401).json({ error: "Invalid API Key" });
+        }
+        
+        userId = ruleData.user_id;
+        const { allow_list, block_list } = ruleData;
 
-        // --- 5. User Lists ---
+        // --- 3. User Allow List ---
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             console.log(`User Allow: ${baseDomain}`);
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
+        // --- 4. User Block List ---
         if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
             console.log(`User Block: ${baseDomain}`);
-            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Blocked by List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
-        // --- 6. AI Check ---
+        // --- 5. AI Check ---
         console.log("AI Check for:", url);
         const decision = await getAIDecision(pageData, ruleData);
         await logBlockingEvent({userId, url, decision, reason: 'AI Decision', pageTitle: pageData?.title});
