@@ -1,5 +1,5 @@
 // FILE: server.js
-// VERSION: v5.0 (Explicit Category Nuance)
+// VERSION: v6.2 (Strict Categories + FIXED Silent System Rules)
 
 // --- Imports ---
 require('dotenv').config();
@@ -20,7 +20,7 @@ if (!supabaseUrl || !supabaseKey || !geminiKey) {
 
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
-// Temp 0 for consistent decisions
+// Temp 0 for consistency
 const model = genAI.getGenerativeModel({ 
     model: "gemini-flash-latest",
     generationConfig: { temperature: 0.0 }
@@ -55,12 +55,18 @@ function getDomainFromUrl(urlString) {
     } catch (e) { console.error("Error extracting domain:", e); return null; }
 }
 
+// --- Helper: Log Blocking Event (FIXED SUPPRESSION) ---
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) return; 
     
-    // Skip logging strictly internal infrastructure
-    if (reason && reason.startsWith('System Rule (Infra)')) return; 
+    // --- THE FIX IS HERE ---
+    // Explicitly skip Search and Navigation logs so they don't clutter the dashboard.
+    if (reason === 'System Rule (Infra)' || 
+        reason === 'Search Allowed' || 
+        reason === 'YouTube Navigation') {
+        return; 
+    }
 
     try {
         const domain = getDomainFromUrl(url);
@@ -91,14 +97,14 @@ async function getUserRuleData(apiKey) {
     return data;
 }
 
-// --- AI Decision Function (With Explicit Nuance) ---
+// --- AI Decision Function (Strict v5.1 Logic) ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
     console.log(`AI Input: Title='${title}'`);
 
-    // 1. Auto-Allow Exact Title/Search Matches (Zero Cost Safety Net)
+    // 1. Auto-Allow Exact Title/Search Matches
     if (searchQuery && title) {
         const cleanSearch = searchQuery.toLowerCase().trim();
         const cleanTitle = title.toLowerCase().trim();
@@ -122,7 +128,7 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
-    // --- NUANCED PROMPT ---
+    // --- STRICT PROMPT INSTRUCTIONS ---
     finalPrompt += `\n\nAnalyze this webpage:
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
@@ -179,29 +185,31 @@ app.post('/check-url', async (req, res) => {
 
         // 1. Infrastructure (Hidden)
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
-             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'System Rule (Infra)', pageTitle: pageData?.title});
+             // SILENT ALLOW
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 2. Search Engines (Logged)
+        // 2. Search Engines (SILENT ALLOW)
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
              
+             // We still construct the title for our own console logs, but the event won't be saved to DB
              let engine = "Search Engine";
              if (hostname.includes('google')) engine = "Google";
              else if (hostname.includes('bing')) engine = "Bing";
              const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
-             
+             console.log(`System Allow: ${displayTitle}`);
+
              await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Allowed', pageTitle: displayTitle});
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 3. YouTube Browsing (Logged)
+        // 3. YouTube Browsing (SILENT ALLOW)
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
+                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Browsing";
+                 console.log(`System Allow: ${displayTitle}`);
                  
-                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Navigation";
-
                  await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: displayTitle});
                  return res.json({ decision: 'ALLOW' });
             }
@@ -214,11 +222,11 @@ app.post('/check-url', async (req, res) => {
         }
 
         if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Blocked by List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title});
             return res.json({ decision: 'BLOCK' });
         }
 
-        // 5. AI Check
+        // 5. AI Check (The ONLY place Search Query appears in logs)
         console.log("Proceeding to AI Check...");
         const decision = await getAIDecision(pageData, ruleData);
         
