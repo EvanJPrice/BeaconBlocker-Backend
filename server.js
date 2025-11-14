@@ -1,5 +1,5 @@
 // FILE: server.js
-// VERSION: v6.2 (Strict Categories + FIXED Silent System Rules)
+// VERSION: v6.3 (Shorts Circuit + Nuanced Prompt + Silent System Rules)
 
 // --- Imports ---
 require('dotenv').config();
@@ -20,7 +20,6 @@ if (!supabaseUrl || !supabaseKey || !geminiKey) {
 
 const genAI = new GoogleGenerativeAI(geminiKey);
 const supabase = createClient(supabaseUrl, supabaseKey);
-// Temp 0 for consistency
 const model = genAI.getGenerativeModel({ 
     model: "gemini-flash-latest",
     generationConfig: { temperature: 0.0 }
@@ -97,14 +96,14 @@ async function getUserRuleData(apiKey) {
     return data;
 }
 
-// --- AI Decision Function (Strict v5.1 Logic) ---
+// --- AI Decision Function ---
 async function getAIDecision(pageData, ruleData) {
     const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
     console.log(`AI Input: Title='${title}'`);
 
-    // 1. Auto-Allow Exact Title/Search Matches
+    // 1. Auto-Allow Exact Matches
     if (searchQuery && title) {
         const cleanSearch = searchQuery.toLowerCase().trim();
         const cleanTitle = title.toLowerCase().trim();
@@ -128,7 +127,6 @@ async function getAIDecision(pageData, ruleData) {
         finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
     }
 
-    // --- STRICT PROMPT INSTRUCTIONS ---
     finalPrompt += `\n\nAnalyze this webpage:
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
@@ -142,9 +140,9 @@ async function getAIDecision(pageData, ruleData) {
     1. **User's Main Prompt:** Highest priority. If they explicitly allow a topic, ALLOW it.
     2. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
     3. **Category Definitions (Strict):**
-       - **"Games":** Refers ONLY to **interactive gameplay** (browser games, cloud gaming). It does **NOT** include videos about games (reviews, news, walkthroughs).
-       - **"Entertainment":** Refers to **passive watching**. This INCLUDES gameplay videos (Let's Plays), streams, movies, and viral clips.
-       - **"Shopping":** Refers ONLY to **transactional pages** (storefronts, checkout). It does **NOT** include product reviews or unboxings.
+       - **"Games":** Refers ONLY to **interactive gameplay**. Not videos about games.
+       - **"Entertainment":** Refers to **passive watching** (Netflix, Viral Clips, Gameplay Videos).
+       - **"Shopping":** Refers ONLY to **transactional pages**. Not reviews.
     4. **General:** Respond with *only* ALLOW or BLOCK.
     `;
 
@@ -176,48 +174,36 @@ app.post('/check-url', async (req, res) => {
         const ruleData = await getUserRuleData(apiKey);
         if (!ruleData) return res.status(401).json({ error: "Invalid API Key" });
         userId = ruleData.user_id;
-        const { allow_list, block_list } = ruleData;
+        const { allow_list, block_list, blocked_categories } = ruleData;
         
         const urlObj = new URL(url);
         const hostname = urlObj.hostname.toLowerCase();
         const pathname = urlObj.pathname;
         const baseDomain = getDomainFromUrl(url);
 
-        // 1. Infrastructure (Hidden)
+        // 1. Infrastructure
         if (baseDomain && SYSTEM_ALLOWED_DOMAINS.some(d => baseDomain.endsWith(d))) {
-             // SILENT ALLOW
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 2. Search Engines (SILENT ALLOW)
+        // 2. Search Engines
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.')) 
             && (pathname === '/' || pathname.startsWith('/search'))) {
-             
-             // We still construct the title for our own console logs, but the event won't be saved to DB
-             let engine = "Search Engine";
-             if (hostname.includes('google')) engine = "Google";
-             else if (hostname.includes('bing')) engine = "Bing";
-             const displayTitle = pageData.searchQuery ? `${engine} Search: "${pageData.searchQuery}"` : `${engine} Home`;
-             console.log(`System Allow: ${displayTitle}`);
-
-             await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Search Allowed', pageTitle: displayTitle});
+             // Silent Allow
              return res.json({ decision: 'ALLOW' });
         }
 
-        // 3. YouTube Browsing (SILENT ALLOW)
+        // 3. YouTube Browsing
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
-                 const displayTitle = pageData.searchQuery ? `Youtube: "${pageData.searchQuery}"` : "YouTube Browsing";
-                 console.log(`System Allow: ${displayTitle}`);
-                 
-                 await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: displayTitle});
+                 // Silent Allow
                  return res.json({ decision: 'ALLOW' });
             }
         }
         
         // 4. User Lists
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Allowed by List', pageTitle: pageData?.title});
+            await logBlockingEvent({userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title});
             return res.json({ decision: 'ALLOW' });
         }
 
@@ -226,7 +212,22 @@ app.post('/check-url', async (req, res) => {
             return res.json({ decision: 'BLOCK' });
         }
 
-        // 5. AI Check (The ONLY place Search Query appears in logs)
+        // --- 4.5 THE SHORTS CIRCUIT (Save Tokens) ---
+        // If it's a Short, AND we are blocking Ent/Social, AND there is no Search Context...
+        // Just Block it. Don't waste tokens on doomscrolling.
+        if (pathname.startsWith('/shorts')) {
+            const isSocialBlocked = blocked_categories['social'];
+            const isEntBlocked = blocked_categories['entertainment'];
+            const hasSearch = !!pageData.searchQuery;
+
+            if ((isSocialBlocked || isEntBlocked) && !hasSearch) {
+                console.log("Shorts Circuit: Blocking Doomscroll");
+                await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Doomscroll Block (Shorts Circuit)', pageTitle: pageData?.title});
+                return res.json({ decision: 'BLOCK' });
+            }
+        }
+
+        // 5. AI Check
         console.log("Proceeding to AI Check...");
         const decision = await getAIDecision(pageData, ruleData);
         
