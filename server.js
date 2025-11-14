@@ -212,18 +212,38 @@ app.post('/check-url', async (req, res) => {
             return res.json({ decision: 'BLOCK' });
         }
 
-        // --- 4.5 THE SHORTS CIRCUIT (Save Tokens) ---
-        // If it's a Short, AND we are blocking Ent/Social, AND there is no Search Context...
-        // Just Block it. Don't waste tokens on doomscrolling.
-        if (pathname.startsWith('/shorts')) {
-            const isSocialBlocked = blocked_categories['social'];
-            const isEntBlocked = blocked_categories['entertainment'];
+        // --- 4.5 SHORTS CIRCUIT (v8.1 - Uses "Shorts" category) ---
+        if (pathname.startsWith('/shorts/') || pathname.startsWith('/reels/') || baseDomain.includes('tiktok')) {
+            // Check the NEW "shorts" category from the dashboard
+            const isShortsBlocked = blocked_categories['shorts']; 
             const hasSearch = !!pageData.searchQuery;
 
-            if ((isSocialBlocked || isEntBlocked) && !hasSearch) {
-                console.log("Shorts Circuit: Blocking Doomscroll");
-                await logBlockingEvent({userId, url, decision: 'BLOCK', reason: 'Doomscroll Block (Shorts Circuit)', pageTitle: pageData?.title});
+            // --- Logic with Search "Carve-Out" ---
+            
+            // 1. Did the user search for this? (e.g., "how to fix sink shorts")
+            if (hasSearch) {
+                console.log("Shorts: Allowing due to Search Context. Proceeding to AI.");
+                // Fall through to the AI Check (Step 5)
+                // The AI will see the search context and (hopefully) allow it.
+            
+            // 2. Did the user block the "Shorts" category and NOT search?
+            } else if (isShortsBlocked) {
+                // This is doomscrolling. Block it.
+                console.log("Shorts Circuit: Blocking (Category Toggled, No Search)");
+                await logBlockingEvent({
+                    userId, 
+                    url, 
+                    decision: 'BLOCK', 
+                    reason: 'Category: Short-Form', 
+                    pageTitle: pageData?.title || 'YouTube Short'
+                });
                 return res.json({ decision: 'BLOCK' });
+
+            // 3. User has NOT blocked shorts and is NOT searching.
+            } else {
+                // Allow it silently without logging to prevent clutter.
+                console.log("Shorts Circuit: Allowed (Category Unchecked)");
+                return res.json({ decision: 'ALLOW' });
             }
         }
 
@@ -253,6 +273,34 @@ app.post('/heartbeat', async (req, res) => {
         } catch (err) { /* ignore */ }
     }
     res.status(200).send('OK');
+});
+
+// --- API Endpoint: Manual Log (for Shorts Session) ---
+app.post('/log-event', async (req, res) => {
+    const authHeader = req.headers['authorization'];
+    const apiKey = authHeader ? authHeader.split(' ')[1] : null;
+    // Get log data from the background script
+    const { title, reason, decision } = req.body; 
+
+    if (!apiKey) return res.status(400).json({ error: 'Missing Key' });
+
+    try {
+        // Get the user ID associated with the API key
+        const ruleData = await getUserRuleData(apiKey);
+        if (ruleData) {
+            // Use our existing helper to log the event
+            await logBlockingEvent({
+                userId: ruleData.user_id,
+                url: 'https://www.youtube.com/shorts', // Use a generic URL
+                decision: decision || 'ALLOW',
+                reason: reason || 'Shorts Session',
+                pageTitle: title
+            });
+        }
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 app.listen(port, () => {
