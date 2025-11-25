@@ -29,6 +29,7 @@ const genAI = new GoogleGenerativeAI(geminiKey);
 console.log("DEBUG: Initializing Supabase...");
 const supabase = createClient(supabaseUrl, supabaseKey);
 console.log("DEBUG: Initializing Gemini...");
+console.log("DEBUG: Connected to Supabase URL:", supabaseUrl); // Verify this matches Vercel!
 const model = genAI.getGenerativeModel({
     model: "gemini-flash-latest",
     generationConfig: { temperature: 0.0 }
@@ -65,7 +66,11 @@ app.post('/login', async (req, res) => {
         password: password,
     });
 
-    if (error) return res.status(401).json({ error: error.message });
+    if (error) {
+        console.error("DEBUG: Login Failed for", email);
+        console.error("DEBUG: Supabase Error:", error);
+        return res.status(401).json({ error: error.message });
+    }
 
     res.json({
         session: data.session,
@@ -306,15 +311,7 @@ app.post('/check-url', verifyToken, async (req, res) => {
 });
 
 // --- Heartbeat ---
-app.post('/heartbeat', async (req, res) => {
-    const apiKey = req.query.key;
-    if (apiKey) {
-        try {
-            await supabase.from('rules').update({ last_seen: new Date().toISOString() }).eq('api_key', apiKey);
-        } catch (err) { /* ignore */ }
-    }
-    res.status(200).send('OK');
-});
+
 
 // --- API Endpoint: Manual Log (for Shorts Session) ---
 app.post('/log-event', verifyToken, async (req, res) => {
