@@ -3,20 +3,14 @@
 
 
 // --- Imports ---
-console.log("DEBUG: Starting server script...");
 require('dotenv').config();
-console.log("DEBUG: dotenv loaded.");
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-console.log("DEBUG: generative-ai loaded.");
 const express = require('express');
-console.log("DEBUG: express loaded.");
 const cors = require('cors');
-console.log("DEBUG: cors loaded.");
 const { createClient } = require('@supabase/supabase-js');
-console.log("DEBUG: supabase-js loaded.");
+const nodemailer = require('nodemailer');
 
 // --- Setup ---
-console.log("DEBUG: Reading env vars...");
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Try to get service role key
@@ -62,46 +56,6 @@ app.get('/', (req, res) => {
     res.send('✅ Beacon Blocker Backend is Running!');
 });
 
-// --- API Endpoint: Test Email (Debug) ---
-app.get('/test-email', async (req, res) => {
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-        return res.status(400).json({ error: "Missing EMAIL_USER or EMAIL_PASS in .env" });
-    }
-
-    try {
-        const emailPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
-        const transporter = nodemailer.createTransport({
-            host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-            port: process.env.EMAIL_PORT || 587,
-            secure: false,
-            auth: {
-                user: process.env.EMAIL_USER,
-                pass: emailPass,
-            },
-        });
-
-        await transporter.verify();
-        await transporter.sendMail({
-            from: process.env.EMAIL_USER,
-            to: process.env.EMAIL_USER,
-            subject: "Test Email from Beacon Blocker",
-            text: "If you see this, your email configuration is working!"
-        });
-
-        res.json({ success: true, message: "Email configuration is valid and test email sent!" });
-    } catch (error) {
-        console.error("Email Test Failed:", error);
-        res.status(500).json({
-            error: "Email Test Failed",
-            message: error.message,
-            code: error.code,
-            command: error.command,
-            response: error.response,
-            stack: error.stack
-        });
-    }
-});
-
 // --- API Endpoint: Increment Cache Version ---
 // Call this when rules are updated
 app.post('/update-rules-signal', verifyToken, (req, res) => {
@@ -131,6 +85,12 @@ async function verifyToken(req, res, next) {
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Missing email or password' });
+
+    // Basic email validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        return res.status(400).json({ error: 'Invalid email format' });
+    }
 
     const { data, error } = await supabase.auth.signInWithPassword({
         email: email,
@@ -186,9 +146,15 @@ async function logBlockingEvent(logData) {
 
     try {
         const domain = getDomainFromUrl(url);
-        console.log(`DEBUG: Attempting to log event for user ${userId} - ${url}`);
+        // Privacy: Avoid logging full URLs in console logs in production
+        // console.log(`DEBUG: Attempting to log event for user ${userId} - ${domain}`);
 
-        // Use supabaseAdmin to bypass RLS
+        // Note on Privacy: We store the full URL and Title so the user can see their own history.
+        // This table should be protected by RLS so only the user can select their own rows.
+        // We use supabaseAdmin here to perform the INSERT (which might bypass RLS on insert),
+        // but reads are restricted.
+
+        // Use supabaseAdmin to bypass RLS for insertion
         const { data, error } = await supabaseAdmin.from('blocking_log').insert({
             user_id: userId,
             url: url || 'Unknown URL',
@@ -201,7 +167,7 @@ async function logBlockingEvent(logData) {
         if (error) {
             console.error("❌ ERROR logging event:", error.message, error.details);
         } else {
-            console.log("✅ Event logged successfully:", data);
+            // console.log("✅ Event logged successfully.");
         }
     } catch (err) { console.error("Logging exception:", err.message); }
 }
@@ -385,6 +351,13 @@ app.post('/check-url', verifyToken, async (req, res) => {
 
     if (!url) return res.status(400).json({ error: 'Missing URL' });
 
+    // Basic URL validation
+    try {
+        new URL(url);
+    } catch (e) {
+        return res.status(400).json({ error: 'Invalid URL format' });
+    }
+
     try {
         const ruleData = await getUserRuleData(userId);
         if (!ruleData) return res.status(404).json({ error: "User rules not found" });
@@ -548,21 +521,22 @@ app.post('/clear-history', verifyToken, async (req, res) => {
     }
 });
 
-const nodemailer = require('nodemailer');
-
 // --- API Endpoint: Report Bug ---
 app.post('/report-bug', async (req, res) => {
     // Note: This endpoint is public (no verifyToken) to allow anonymous reports if needed,
     // but the frontend sends a token if available.
-    // Ideally, we should verify token if provided, but for simplicity we'll just accept it.
 
     const { description, steps, anonymous, user_id, user_email, timestamp, recipient } = req.body;
 
+    // Basic Validation
+    if (!description || description.length > 5000) {
+        return res.status(400).json({ error: "Description is missing or too long." });
+    }
+
     console.log(`\n🐛 BUG REPORT RECEIVED:`);
+    // Privacy: Only log essential info
     console.log(`To: ${recipient}`);
-    console.log(`From: ${anonymous ? 'Anonymous' : user_id}`);
-    console.log(`Email: ${anonymous ? 'Hidden' : user_email}`);
-    console.log(`Using Service Key: ${!!process.env.SUPABASE_SERVICE_ROLE_KEY}`);
+    console.log(`From: ${anonymous ? 'Anonymous' : 'User ' + user_id}`);
 
     try {
         // 1. Save to DB
@@ -677,29 +651,9 @@ app.post('/delete-account', verifyToken, async (req, res) => {
     }
 });
 
-// --- API Endpoint: Check Email Existence (For better login errors) ---
-app.post('/check-email', async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Missing email" });
-
-    try {
-        // Note: listUsers is not efficient for large user bases, but works for this scale.
-        // We fetch a page of users. If we had many, we'd need to paginate.
-        const { data: { users }, error } = await supabaseAdmin.auth.admin.listUsers({
-            page: 1,
-            perPage: 1000
-        });
-
-        if (error) throw error;
-
-        const exists = users.some(u => u.email.toLowerCase() === email.toLowerCase());
-        res.json({ exists });
-
-    } catch (error) {
-        console.error("Check Email Error:", error);
-        res.status(500).json({ error: error.message });
-    }
-});
+// --- API Endpoint: Check Email Existence ---
+// DEPRECATED/REMOVED due to privacy concerns (User Enumeration Risk).
+// app.post('/check-email', ...)
 
 // --- API Endpoint: Test Email (Debug) ---
 app.get('/test-email', async (req, res) => {
