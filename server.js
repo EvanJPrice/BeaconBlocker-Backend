@@ -260,20 +260,10 @@ async function getAIDecision(pageData, ruleData) {
         'travel': 'Travel & Real Estate', // Added in v8.3
         'forums': 'Forums' // Added in v8.3
     };
-    const CATEGORY_DEFINITIONS = `
-- Social Media: Facebook, Instagram, Twitter/X, LinkedIn, Snapchat, Pinterest, Tumblr.
-- Shorts & Reels: TikTok, YouTube Shorts, Instagram Reels.
-- News & Politics: CNN, Fox, BBC, NYT, Washington Post, The Guardian.
-- Movies & TV: Premium Movies & TV Series (Netflix, Hulu, Disney+, HBO, Prime Video). NOT YouTube/Twitch.
-- Streaming Services: User-Generated Content & Live Streams (YouTube, Twitch, Kick). NOT Netflix/Hulu.
-- Gaming: Steam, Roblox, IGN, Kotaku, Discord (Gaming communities).
-- Sports: ESPN, NBA, NFL, MLB, Live Sports, Sports News.
-- Finance: Coinbase, Binance, Stocks, Trading, Financial News.
-- Travel & Real Estate: Airbnb, Zillow, Booking, Redfin, Trulia, Expedia, Hotels.
-- Forums: Reddit, Quora, StackOverflow, Hacker News.
-- Shopping: Amazon, eBay, Shopify, Etsy, Walmart, Target.
-- Mature Content: Adult sites, Gambling, Betting.
-`;
+    // CATEGORY_DEFINITIONS was previously here but unused in the prompt construction below.
+    // The prompt only uses 'explicitBlockList' derived from 'BLOCKED_CATEGORY_LABELS'.
+    // Removing the unused variable.
+
     const selectedCategoryLabels = Object.entries(blocked_categories || {})
         .filter(([, value]) => value === true)
         .map(([key]) => BLOCKED_CATEGORY_LABELS[key] || key);

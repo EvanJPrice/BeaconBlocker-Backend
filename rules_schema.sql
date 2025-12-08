@@ -6,8 +6,6 @@ create table if not exists public.rules (
   blocked_categories jsonb default '{}'::jsonb,
   allow_list text[] default array[]::text[],
   block_list text[] default array[]::text[],
-  last_seen timestamp with time zone default timezone('utc'::text, now()),
-  api_key text,
   
   -- CONSTRAINT: Ensure one row per user
   constraint unique_user_id unique (user_id)
