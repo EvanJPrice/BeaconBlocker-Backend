@@ -1,6 +1,7 @@
 // FILE: server.js
 // VERSION: v6.3 (Shorts Circuit + Nuanced Prompt + Silent System Rules)
 
+
 // --- Imports ---
 console.log("DEBUG: Starting server script...");
 require('dotenv').config();
@@ -18,6 +19,7 @@ console.log("DEBUG: supabase-js loaded.");
 console.log("DEBUG: Reading env vars...");
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Try to get service role key
 const geminiKey = process.env.GOOGLE_API_KEY;
 
 if (!supabaseUrl || !supabaseKey || !geminiKey) {
@@ -27,17 +29,86 @@ if (!supabaseUrl || !supabaseKey || !geminiKey) {
 
 const genAI = new GoogleGenerativeAI(geminiKey);
 console.log("DEBUG: Initializing Supabase...");
-const supabase = createClient(supabaseUrl, supabaseKey);
+const supabase = createClient(supabaseUrl, supabaseKey); // For Auth verification
+// Use Service Role Key for DB writes if available, otherwise fallback (which might fail RLS)
+const supabaseAdmin = supabaseServiceKey ? createClient(supabaseUrl, supabaseServiceKey) : supabase;
+
 console.log("DEBUG: Initializing Gemini...");
-console.log("DEBUG: Connected to Supabase URL:", supabaseUrl); // Verify this matches Vercel!
+console.log("DEBUG: Connected to Supabase URL:", supabaseUrl);
+if (supabaseServiceKey) console.log("DEBUG: Service Role Key loaded for DB writes.");
+
 const model = genAI.getGenerativeModel({
     model: "gemini-flash-latest",
     generationConfig: { temperature: 0.0 }
 });
 const app = express();
+
 const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
+
+// --- Debug Middleware ---
+app.use((req, res, next) => {
+    console.log(`DEBUG: Incoming Request: ${req.method} ${req.url}`);
+    next();
+});
+
+// --- Global Cache Versioning ---
+// This allows the server to force all extensions to clear their cache when rules change.
+let globalCacheVersion = Date.now();
+
+// --- Root Route for Verification ---
+app.get('/', (req, res) => {
+    res.send('✅ Beacon Blocker Backend is Running!');
+});
+
+// --- API Endpoint: Test Email (Debug) ---
+app.get('/test-email', async (req, res) => {
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+        return res.status(400).json({ error: "Missing EMAIL_USER or EMAIL_PASS in .env" });
+    }
+
+    try {
+        const emailPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
+        const transporter = nodemailer.createTransport({
+            host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+            port: process.env.EMAIL_PORT || 587,
+            secure: false,
+            auth: {
+                user: process.env.EMAIL_USER,
+                pass: emailPass,
+            },
+        });
+
+        await transporter.verify();
+        await transporter.sendMail({
+            from: process.env.EMAIL_USER,
+            to: process.env.EMAIL_USER,
+            subject: "Test Email from Beacon Blocker",
+            text: "If you see this, your email configuration is working!"
+        });
+
+        res.json({ success: true, message: "Email configuration is valid and test email sent!" });
+    } catch (error) {
+        console.error("Email Test Failed:", error);
+        res.status(500).json({
+            error: "Email Test Failed",
+            message: error.message,
+            code: error.code,
+            command: error.command,
+            response: error.response,
+            stack: error.stack
+        });
+    }
+});
+
+// --- API Endpoint: Increment Cache Version ---
+// Call this when rules are updated
+app.post('/update-rules-signal', verifyToken, (req, res) => {
+    globalCacheVersion = Date.now();
+    console.log(`Rules updated. New Cache Version: ${globalCacheVersion}`);
+    res.json({ success: true, cacheVersion: globalCacheVersion });
+});
 
 // --- Middleware: Verify Supabase JWT ---
 async function verifyToken(req, res, next) {
@@ -103,51 +174,84 @@ function getDomainFromUrl(urlString) {
     } catch (e) { console.error("Error extracting domain:", e); return null; }
 }
 
-// --- Helper: Log Blocking Event (FIXED SUPPRESSION) ---
+// --- Helper: Log Blocking Event ---
 async function logBlockingEvent(logData) {
     const { userId, url, decision, reason, pageTitle } = logData;
     if (!userId) return;
 
-    // --- THE FIX IS HERE ---
-    // Explicitly skip Search and Navigation logs so they don't clutter the dashboard.
-    if (reason === 'System Rule (Infra)' ||
-        reason === 'Search Allowed' ||
-        reason === 'YouTube Navigation') {
+    // Skip only System Rules (Infra) to keep logs clean, but ALLOW Search/Nav logs now.
+    if (reason === 'System Rule (Infra)') {
         return;
     }
 
     try {
         const domain = getDomainFromUrl(url);
-        const { error } = await supabase.from('blocking_log').insert({
+        console.log(`DEBUG: Attempting to log event for user ${userId} - ${url}`);
+
+        // Use supabaseAdmin to bypass RLS
+        const { data, error } = await supabaseAdmin.from('blocking_log').insert({
             user_id: userId,
             url: url || 'Unknown URL',
             domain: domain || 'Unknown Domain',
             decision: decision,
             reason: reason,
             page_title: pageTitle || ''
-        });
-        if (error) console.error("Error logging event:", error.message);
+        }).select();
+
+        if (error) {
+            console.error("❌ ERROR logging event:", error.message, error.details);
+        } else {
+            console.log("✅ Event logged successfully:", data);
+        }
     } catch (err) { console.error("Logging exception:", err.message); }
 }
 
 async function getUserRuleData(userId) {
     if (!userId) return null;
-    const { data, error } = await supabase
-        .from('rules')
-        .select('user_id, prompt, blocked_categories, allow_list, block_list, last_seen')
-        .eq('user_id', userId)
-        .single();
+    // console.log(`DEBUG: Fetching rules for user ${userId}`);
 
-    if (error || !data) return null;
-    data.allow_list = data.allow_list || [];
-    data.block_list = data.block_list || [];
-    data.blocked_categories = data.blocked_categories || {};
-    return data;
+    // MUST use supabaseAdmin to bypass RLS, as the server has no user session
+    const { data, error } = await supabaseAdmin
+        .from('rules')
+        .select('prompt, blocked_categories, allow_list, block_list')
+        .eq('user_id', userId)
+        .limit(1);
+
+    if (error) {
+        console.error("DEBUG: Error fetching rules:", error.message);
+        return null;
+    }
+
+    if (!data || data.length === 0) {
+        // console.log("DEBUG: No rules found for user (New Account?)");
+        return { prompt: '', blocked_categories: {}, allow_list: [], block_list: [] };
+    }
+
+    const ruleData = data[0];
+    // console.log("DEBUG: Rule Data:", JSON.stringify(ruleData, null, 2));
+
+    ruleData.allow_list = ruleData.allow_list || [];
+    ruleData.block_list = ruleData.block_list || [];
+
+
+
+    // Ensure blocked_categories is an object
+    if (typeof ruleData.blocked_categories === 'string') {
+        try {
+            ruleData.blocked_categories = JSON.parse(ruleData.blocked_categories);
+        } catch (e) {
+            console.error("Error parsing blocked_categories:", e);
+            ruleData.blocked_categories = {};
+        }
+    }
+    ruleData.blocked_categories = ruleData.blocked_categories || {};
+
+    return ruleData;
 }
 
 // --- AI Decision Function ---
 async function getAIDecision(pageData, ruleData) {
-    const { title, description, h1, url, searchQuery, keywords, bodyText } = pageData;
+    const { title, description, h1, url, searchQuery, keywords, bodyText, localTime } = pageData;
     const { prompt: userMainPrompt, blocked_categories } = ruleData;
 
     console.log(`AI Input: Title='${title}'`);
@@ -158,53 +262,118 @@ async function getAIDecision(pageData, ruleData) {
         const cleanTitle = title.toLowerCase().trim();
         if (cleanTitle.includes(cleanSearch) || cleanSearch.includes(cleanTitle)) {
             console.log(`Auto-Allow: Search '${cleanSearch}' matches title.`);
-            return 'ALLOW';
+            return { decision: 'ALLOW', reason: `Matches search: "${cleanSearch}"` };
         }
     }
 
-    let finalPrompt = userMainPrompt || "No prompt provided.";
+    // 2. Default to ALLOW if no rules are set (Passive Mode)
+    const hasPrompt = userMainPrompt && userMainPrompt.trim().length > 0;
+    const hasCategories = blocked_categories && Object.values(blocked_categories).some(v => v === true);
+
+    console.log("DEBUG: Category Check:", {
+        blocked_categories,
+        hasCategories,
+        values: blocked_categories ? Object.values(blocked_categories) : 'null'
+    });
+
+    if (!hasPrompt && !hasCategories) {
+        console.log("No rules set. Defaulting to ALLOW (Passive Mode).");
+        const debugInfo = `Cats: ${blocked_categories ? Object.keys(blocked_categories).length : 'null'}`;
+        return { decision: 'ALLOW', reason: `No rules set (Passive Mode) [${debugInfo}]` };
+    }
+
+    // let finalPrompt = userMainPrompt || "No specific focus goal provided."; // REMOVED DUPLICATE
     const BLOCKED_CATEGORY_LABELS = {
         'social': 'Social Media', 'news': 'News & Politics',
-        'entertainment': 'Entertainment', 'games': 'Games',
-        'shopping': 'Online Shopping', 'mature': 'Mature Content'
+        'entertainment': 'Movies & TV', 'games': 'Games',
+        'shopping': 'Online Shopping', 'mature': 'Mature Content',
+        'shorts': 'Short-Form Content', // Added in v8.1
+        'streaming': 'Streaming Services', // Added in v8.2
+        'sports': 'Sports', // Added in v8.3
+        'finance': 'Finance', // Added in v8.3
+        'travel': 'Travel & Real Estate', // Added in v8.3
+        'forums': 'Forums' // Added in v8.3
     };
+    const CATEGORY_DEFINITIONS = `
+- Social Media: Facebook, Instagram, Twitter/X, LinkedIn, Snapchat, Pinterest, Tumblr.
+- Shorts & Reels: TikTok, YouTube Shorts, Instagram Reels.
+- News & Politics: CNN, Fox, BBC, NYT, Washington Post, The Guardian.
+- Movies & TV: Premium Movies & TV Series (Netflix, Hulu, Disney+, HBO, Prime Video). NOT YouTube/Twitch.
+- Streaming Services: User-Generated Content & Live Streams (YouTube, Twitch, Kick). NOT Netflix/Hulu.
+- Gaming: Steam, Roblox, IGN, Kotaku, Discord (Gaming communities).
+- Sports: ESPN, NBA, NFL, MLB, Live Sports, Sports News.
+- Finance: Coinbase, Binance, Stocks, Trading, Financial News.
+- Travel & Real Estate: Airbnb, Zillow, Booking, Redfin, Trulia, Expedia, Hotels.
+- Forums: Reddit, Quora, StackOverflow, Hacker News.
+- Shopping: Amazon, eBay, Shopify, Etsy, Walmart, Target.
+- Mature Content: Adult sites, Gambling, Betting.
+`;
     const selectedCategoryLabels = Object.entries(blocked_categories || {})
         .filter(([, value]) => value === true)
         .map(([key]) => BLOCKED_CATEGORY_LABELS[key] || key);
 
-    if (selectedCategoryLabels.length > 0) {
-        finalPrompt += `\n\n**Explicitly Blocked Categories:**\n- ${selectedCategoryLabels.join('\n- ')}`;
-    }
+    const explicitBlockList = selectedCategoryLabels.join(', ');
 
-    finalPrompt += `\n\nAnalyze this webpage:
+    const finalPrompt = `
+    You are a strict website blocking assistant.
+    
+    **USER'S MAIN PROMPT:** "${userMainPrompt || 'No specific prompt provided.'}"
+    **CURRENT USER TIME:** "${localTime || 'Unknown'}"
+    (If the user's prompt mentions a time limit like "until 5pm", compare it with this time to decide.)
+    
+    **EXPLICITLY BLOCKED CATEGORIES:** [${explicitBlockList}]
+    (If a category is NOT listed here, it is ALLOWED unless the Main Prompt says otherwise).
+
+    **WEBSITE CONTENT:**
     - URL: "${url}"
     - Title: "${title || 'N/A'}"
     - Description: "${description || 'N/A'}"
     - Keywords: "${keywords || 'N/A'}" 
     - Body Snippet: "${bodyText || 'N/A'}" 
-    - Search Query (Context): "${searchQuery || 'N/A'}"
 
-    My user's rule details are above.
+    **OUTPUT FORMAT:**
+    Respond with valid JSON ONLY. No markdown formatting.
+    {
+        "decision": "ALLOW" or "BLOCK",
+        "reason": "A short, concise explanation (max 10 words) for the user."
+    }
+
     **CRITICAL INSTRUCTIONS (Priority Order):**
     1. **User's Main Prompt:** Highest priority. If they explicitly allow a topic, ALLOW it.
-    2. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
-    3. **Category Definitions (Strict):**
-       - **"Games":** Refers ONLY to **interactive gameplay**. Not videos about games.
-       - **"Entertainment":** Refers to **passive watching** (Netflix, Viral Clips, Gameplay Videos).
-       - **"Shopping":** Refers ONLY to **transactional pages**. Not reviews.
-    4. **General:** Respond with *only* ALLOW or BLOCK.
+    2. **Platform Overrides Content (CRITICAL):**
+       - If the URL belongs to a known platform, you MUST classify it under that platform's category, regardless of the specific content.
+       - **YouTube/Twitch** = **Streaming Services** (NOT Entertainment, NOT Education).
+       - **Netflix/Hulu** = **Entertainment** (NOT Streaming).
+       - **Example:** A YouTube video about "History" is "Streaming Services". If "Streaming Services" is Unchecked, ALLOW it.
+    3. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
+    4. **Unchecked Categories:**
+       - If a category is **NOT** listed in "Explicitly Blocked Categories", do **NOT** use that category as a reason to block.
+       - **Exception:** If the User's Main Prompt explicitly asks to "block distractions", you SHOULD block Social/Entertainment/Games even if unchecked.
+       - Only block unlisted categories if they **DIRECTLY CONFLICT** with the User's Main Prompt.
+    5. **Reasoning Clarity:**
+       - If you **ALLOW** because no rule is violated, set reason to: **"No relevant blocking rules found"**.
     `;
 
     try {
         const result = await model.generateContent(finalPrompt);
         const response = await result.response;
-        let decision = response.text().trim().toUpperCase();
-        if (decision.includes('BLOCK')) return 'BLOCK';
-        if (decision.includes('ALLOW')) return 'ALLOW';
-        return 'BLOCK';
+        const text = response.text().trim().replace(/```json/g, '').replace(/```/g, ''); // Clean markdown
+
+        try {
+            const jsonResponse = JSON.parse(text);
+            return {
+                decision: jsonResponse.decision?.toUpperCase() || 'BLOCK',
+                reason: jsonResponse.reason || 'AI Decision'
+            };
+        } catch (e) {
+            console.error("AI JSON Parse Error:", e);
+            // Fallback if JSON fails
+            if (text.toUpperCase().includes('ALLOW')) return { decision: 'ALLOW', reason: 'AI Allowed (Parse Error)' };
+            return { decision: 'BLOCK', reason: 'AI Blocked (Parse Error)' };
+        }
     } catch (error) {
         console.error('AI Error:', error.message);
-        return 'BLOCK';
+        return { decision: 'BLOCK', reason: 'AI Error' };
     }
 }
 
@@ -235,14 +404,16 @@ app.post('/check-url', verifyToken, async (req, res) => {
         // 2. Search Engines
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.'))
             && (pathname === '/' || pathname.startsWith('/search'))) {
-            // Silent Allow
+            // Log this now!
+            await logBlockingEvent({ userId, url, decision: 'ALLOW', reason: 'Search Engine', pageTitle: pageData?.title });
             return res.json({ decision: 'ALLOW' });
         }
 
         // 3. YouTube Browsing
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
-                // Silent Allow
+                // Log navigation too
+                await logBlockingEvent({ userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: pageData?.title });
                 return res.json({ decision: 'ALLOW' });
             }
         }
@@ -289,19 +460,28 @@ app.post('/check-url', verifyToken, async (req, res) => {
             } else {
                 // Allow it silently without logging to prevent clutter.
                 console.log("Shorts Circuit: Allowed (Category Unchecked)");
-                return res.json({ decision: 'ALLOW' });
+                return res.json({ decision: 'ALLOW', cacheVersion: globalCacheVersion });
             }
         }
 
         // 5. AI Check
         console.log("Proceeding to AI Check...");
-        const decision = await getAIDecision(pageData, ruleData);
+        console.log("DEBUG: Rule Data:", {
+            prompt: ruleData.prompt,
+            categories: ruleData.blocked_categories,
+            hasPrompt: ruleData.prompt && ruleData.prompt.trim().length > 0,
+            hasCategories: ruleData.blocked_categories && Object.values(ruleData.blocked_categories).some(v => v === true)
+        });
+
+        const aiResult = await getAIDecision(pageData, ruleData);
+        console.log("DEBUG: AI Result:", aiResult);
+        // aiResult is now { decision: "...", reason: "..." }
 
         let logTitle = pageData?.title || "Unknown Page";
         if (pageData.searchQuery) logTitle += ` [Search: '${pageData.searchQuery}']`;
 
-        await logBlockingEvent({ userId, url, decision, reason: 'AI Decision', pageTitle: logTitle });
-        res.json({ decision: decision });
+        await logBlockingEvent({ userId, url, decision: aiResult.decision, reason: aiResult.reason, pageTitle: logTitle });
+        res.json({ decision: aiResult.decision, cacheVersion: globalCacheVersion });
 
     } catch (err) {
         console.error("Server Error:", err.message);
@@ -331,6 +511,233 @@ app.post('/log-event', verifyToken, async (req, res) => {
         res.json({ success: true });
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+// --- API Endpoint: Clear History ---
+app.post('/clear-history', verifyToken, async (req, res) => {
+    const userId = req.user.id;
+    console.log(`Clearing history for user: ${userId}`);
+
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+        console.error("❌ ERROR: SUPABASE_SERVICE_ROLE_KEY is missing. Cannot delete history.");
+        return res.status(500).json({ error: "Server misconfiguration: Missing Service Role Key" });
+    }
+
+    try {
+        const { error, count } = await supabaseAdmin
+            .from('blocking_log')
+            .delete({ count: 'exact' }) // Request count of deleted rows
+            .eq('user_id', userId);
+
+        if (error) {
+            console.error("Supabase Delete Error:", error);
+            throw error;
+        }
+
+        console.log(`History cleared. Deleted ${count} rows.`);
+
+        // Force cache clear on all extensions
+        globalCacheVersion = Date.now();
+        console.log(`Cache version updated to: ${globalCacheVersion}`);
+
+        res.json({ success: true, deletedCount: count, cacheVersion: globalCacheVersion });
+    } catch (e) {
+        console.error("Error clearing history:", e);
+        res.status(500).json({ error: e.message || "Database error" });
+    }
+});
+
+const nodemailer = require('nodemailer');
+
+// --- API Endpoint: Report Bug ---
+app.post('/report-bug', async (req, res) => {
+    // Note: This endpoint is public (no verifyToken) to allow anonymous reports if needed,
+    // but the frontend sends a token if available.
+    // Ideally, we should verify token if provided, but for simplicity we'll just accept it.
+
+    const { description, steps, anonymous, user_id, user_email, timestamp, recipient } = req.body;
+
+    console.log(`\n🐛 BUG REPORT RECEIVED:`);
+    console.log(`To: ${recipient}`);
+    console.log(`From: ${anonymous ? 'Anonymous' : user_id}`);
+    console.log(`Email: ${anonymous ? 'Hidden' : user_email}`);
+    console.log(`Using Service Key: ${!!process.env.SUPABASE_SERVICE_ROLE_KEY}`);
+
+    try {
+        // 1. Save to DB
+        console.log("Attempting to insert into bug_reports...");
+        const { data, error } = await supabaseAdmin.from('bug_reports').insert({
+            user_id: anonymous ? null : user_id,
+            description,
+            steps,
+            anonymous,
+            recipient,
+            created_at: timestamp || new Date().toISOString()
+        }).select();
+
+        if (error) {
+            console.error("❌ Error saving bug report to DB:", error);
+            return res.status(500).json({ error: "DB Error: " + error.message, details: error });
+        } else {
+            console.log(`✅ Bug report saved to DB. Data:`, data);
+        }
+
+        // 2. Send Email
+        if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+            // Strip spaces from password just in case
+            const emailPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
+
+            const transporter = nodemailer.createTransport({
+                host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+                port: process.env.EMAIL_PORT || 587,
+                secure: false,
+                auth: {
+                    user: process.env.EMAIL_USER,
+                    pass: emailPass,
+                },
+            });
+
+            const mailOptions = {
+                from: `"Beacon Blocker" <${process.env.EMAIL_USER}>`,
+                to: recipient,
+                replyTo: user_email || undefined, // Allow replying to the user
+                subject: `🐛 Bug Report: ${description.substring(0, 50)}...`,
+                text: `
+User: ${anonymous ? 'Anonymous' : user_id}
+Email: ${anonymous ? 'Hidden' : (user_email || 'Not provided')}
+
+Description:
+${description}
+
+Steps to Reproduce:
+${steps || 'N/A'}
+
+Timestamp: ${timestamp}
+                `
+            }; await transporter.sendMail(mailOptions);
+            console.log(`📧 Email sent to ${mailOptions.to}`);
+        } else {
+            console.log("⚠️ Email not configured, skipping email notification.");
+        }
+
+        res.status(200).json({ success: true, message: 'Bug report saved and email sent (if configured)' });
+
+    } catch (error) {
+        console.error("❌ Error processing bug report:", error);
+        res.status(500).json({ error: "Server Error: " + error.message });
+    }
+});
+
+// --- API Endpoint: Delete Account ---
+app.post('/delete-account', verifyToken, async (req, res) => {
+    const userId = req.user.id;
+    console.log(`\n🚨 DELETE ACCOUNT REQUEST for User: ${userId}`);
+
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
+        console.error("❌ ERROR: SUPABASE_SERVICE_ROLE_KEY is missing. Cannot delete account.");
+        return res.status(500).json({ error: "Server misconfiguration: Missing Service Role Key" });
+    }
+
+    try {
+        // 1. Delete User Data (Rules, Logs, Bug Reports)
+        // Using supabaseAdmin to bypass RLS
+        const { error: rulesError } = await supabaseAdmin.from('rules').delete().eq('user_id', userId);
+        if (rulesError) {
+            console.error("Error deleting rules:", rulesError);
+            throw rulesError;
+        }
+
+        const { error: logsError } = await supabaseAdmin.from('blocking_log').delete().eq('user_id', userId);
+        if (logsError) {
+            console.error("Error deleting logs:", logsError);
+            throw logsError;
+        }
+
+        const { error: bugsError } = await supabaseAdmin.from('bug_reports').delete().eq('user_id', userId);
+        if (bugsError) {
+            console.error("Error deleting bug reports:", bugsError);
+            // We might want to keep bug reports for history, but for full deletion we remove them.
+            // If this fails, we proceed anyway as it's less critical.
+        }
+
+        // 2. Delete User Auth Account
+        const { error: authError } = await supabaseAdmin.auth.admin.deleteUser(userId);
+        if (authError) {
+            console.error("Error deleting auth user:", authError);
+            throw authError;
+        }
+
+        console.log(`✅ Account deleted successfully for ${userId}`);
+        res.json({ success: true });
+
+    } catch (error) {
+        console.error("❌ Error deleting account:", error);
+        res.status(500).json({ error: "Failed to delete account: " + error.message });
+    }
+});
+
+// --- API Endpoint: Check Email Existence (For better login errors) ---
+app.post('/check-email', async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Missing email" });
+
+    try {
+        // Note: listUsers is not efficient for large user bases, but works for this scale.
+        // We fetch a page of users. If we had many, we'd need to paginate.
+        const { data: { users }, error } = await supabaseAdmin.auth.admin.listUsers({
+            page: 1,
+            perPage: 1000
+        });
+
+        if (error) throw error;
+
+        const exists = users.some(u => u.email.toLowerCase() === email.toLowerCase());
+        res.json({ exists });
+
+    } catch (error) {
+        console.error("Check Email Error:", error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- API Endpoint: Test Email (Debug) ---
+app.get('/test-email', async (req, res) => {
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+        return res.status(400).json({ error: "Missing EMAIL_USER or EMAIL_PASS in .env" });
+    }
+
+    try {
+        const emailPass = process.env.EMAIL_PASS.replace(/\s+/g, '');
+        const transporter = nodemailer.createTransport({
+            host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+            port: process.env.EMAIL_PORT || 587,
+            secure: false,
+            auth: {
+                user: process.env.EMAIL_USER,
+                pass: emailPass,
+            },
+        });
+
+        await transporter.verify();
+        await transporter.sendMail({
+            from: process.env.EMAIL_USER,
+            to: process.env.EMAIL_USER,
+            subject: "Test Email from Beacon Blocker",
+            text: "If you see this, your email configuration is working!"
+        });
+
+        res.json({ success: true, message: "Email configuration is valid and test email sent!" });
+    } catch (error) {
+        console.error("Email Test Failed:", error);
+        res.status(500).json({
+            error: "Email Test Failed",
+            message: error.message,
+            code: error.code,
+            command: error.command,
+            response: error.response,
+            stack: error.stack
+        });
     }
 });
 
