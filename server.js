@@ -1,6 +1,9 @@
 // FILE: server.js
 // VERSION: v6.3 (Shorts Circuit + Nuanced Prompt + Silent System Rules)
-
+console.log(`\n\n-- - 🚀 SERVER RESTARTED AT ${new Date().toLocaleTimeString()} ---\n\n`);
+// --- 🕵️ DEBUG COUNTERS ---
+let requestCount = 0; // Total traffic from browser
+let aiCostCount = 0;  // Actual calls to Google (The "Billable" ones)
 
 // --- Imports ---
 console.log("DEBUG: Starting server script...");
@@ -38,7 +41,7 @@ console.log("DEBUG: Connected to Supabase URL:", supabaseUrl);
 if (supabaseServiceKey) console.log("DEBUG: Service Role Key loaded for DB writes.");
 
 const model = genAI.getGenerativeModel({
-    model: "gemini-flash-latest",
+    model: "gemini-flash-latest",  // Using latest flash model (requires paid tier for sufficient quota)
     generationConfig: { temperature: 0.0 }
 });
 const app = express();
@@ -213,7 +216,7 @@ async function getUserRuleData(userId) {
     // MUST use supabaseAdmin to bypass RLS, as the server has no user session
     const { data, error } = await supabaseAdmin
         .from('rules')
-        .select('prompt, blocked_categories, allow_list, block_list')
+        .select('prompt, blocked_categories, allow_list, block_list, last_updated')
         .eq('user_id', userId)
         .limit(1);
 
@@ -228,7 +231,8 @@ async function getUserRuleData(userId) {
     }
 
     const ruleData = data[0];
-    // console.log("DEBUG: Rule Data:", JSON.stringify(ruleData, null, 2));
+    // DEBUG LOG: Prove that we have the time
+    console.log(`DEBUG: Rule Time Fetch: ${ruleData.last_updated ? 'Success' : 'MISSING'}`)
 
     ruleData.allow_list = ruleData.allow_list || [];
     ruleData.block_list = ruleData.block_list || [];
@@ -249,14 +253,55 @@ async function getUserRuleData(userId) {
     return ruleData;
 }
 
-// --- AI Decision Function ---
 async function getAIDecision(pageData, ruleData) {
-    const { title, description, h1, url, searchQuery, keywords, bodyText, localTime } = pageData;
-    const { prompt: userMainPrompt, blocked_categories } = ruleData;
+    const { title, url, localTime, bodyText, description, keywords, searchQuery } = pageData;
+    const { prompt: userMainPrompt, blocked_categories, last_updated } = ruleData;
+
+    // --- 1. DEFINE TIME CONTEXT ---
+    let diffMinutes = 0;
+
+    // Parse the user's local time for structured data (e.g., "Tuesday, 8:44 AM")
+    // We'll also provide 24-hour format for easier AI parsing
+    const now = new Date();
+    const userHour24 = now.getHours(); // 0-23
+    const userMinute = now.getMinutes();
+    const userHour12 = userHour24 % 12 || 12;
+    const ampm = userHour24 >= 12 ? 'PM' : 'AM';
+
+    let timeContext = `**CURRENT USER TIME:** "${localTime || 'Unknown'}"
+**CURRENT TIME (24h):** ${userHour24}:${String(userMinute).padStart(2, '0')}
+**CURRENT TIME (12h):** ${userHour12}:${String(userMinute).padStart(2, '0')} ${ampm}
+`;
+
+    // --- 2. CALCULATE RULE AGE (for timer blocks) ---
+    if (last_updated) {
+        const lastUpdateDate = new Date(last_updated);
+        const diffMs = now - lastUpdateDate;
+        diffMinutes = Math.floor(diffMs / 60000);
+
+        console.log(`⏱️ DEBUG: Rule is ${diffMinutes} minutes old.`);
+
+        timeContext += `**RULE SET:** ${diffMinutes} minutes ago.
+**TIMER BLOCK MATH:** If user sets a duration (e.g., "for 30 mins"):
+    REMAINING = Duration - ${diffMinutes}
+    If REMAINING > 0 → ACTIVE (include "(X mins left)" in reason)
+    If REMAINING <= 0 → EXPIRED → ALLOW
+
+**CLOCK BLOCK MATH:** If user sets an absolute time (e.g., "until 5pm" or "after 3pm"):
+    Convert target to 24h format (5pm = 17:00, 9am = 9:00)
+    Current time is ${userHour24}:${String(userMinute).padStart(2, '0')}
+    "until 5pm" means BLOCK if current < 17:00, else ALLOW
+    "after 6pm" means BLOCK if current >= 18:00, else ALLOW
+`;
+    } else {
+        console.log("⚠️ DEBUG: No timestamp found. Assuming 0 minutes.");
+        timeContext += `**RULE SET:** Just now (0 minutes ago).
+`;
+    }
 
     console.log(`AI Input: Title='${title}'`);
 
-    // 1. Auto-Allow Exact Matches
+    // --- Auto-Allow Exact Matches ---
     if (searchQuery && title) {
         const cleanSearch = searchQuery.toLowerCase().trim();
         const cleanTitle = title.toLowerCase().trim();
@@ -266,20 +311,12 @@ async function getAIDecision(pageData, ruleData) {
         }
     }
 
-    // 2. Default to ALLOW if no rules are set (Passive Mode)
+    // --- Passive Mode Check (EARLY EXIT - Save API calls) ---
     const hasPrompt = userMainPrompt && userMainPrompt.trim().length > 0;
     const hasCategories = blocked_categories && Object.values(blocked_categories).some(v => v === true);
 
-    console.log("DEBUG: Category Check:", {
-        blocked_categories,
-        hasCategories,
-        values: blocked_categories ? Object.values(blocked_categories) : 'null'
-    });
-
     if (!hasPrompt && !hasCategories) {
-        console.log("No rules set. Defaulting to ALLOW (Passive Mode).");
-        const debugInfo = `Cats: ${blocked_categories ? Object.keys(blocked_categories).length : 'null'}`;
-        return { decision: 'ALLOW', reason: `No rules set (Passive Mode) [${debugInfo}]` };
+        return { decision: 'ALLOW', reason: `No rules set (Passive Mode)` };
     }
 
     // let finalPrompt = userMainPrompt || "No specific focus goal provided."; // REMOVED DUPLICATE
@@ -318,8 +355,8 @@ async function getAIDecision(pageData, ruleData) {
     You are a strict website blocking assistant.
     
     **USER'S MAIN PROMPT:** "${userMainPrompt || 'No specific prompt provided.'}"
-    **CURRENT USER TIME:** "${localTime || 'Unknown'}"
-    (If the user's prompt mentions a time limit like "until 5pm", compare it with this time to decide.)
+    
+    ${timeContext} 
     
     **EXPLICITLY BLOCKED CATEGORIES:** [${explicitBlockList}]
     (If a category is NOT listed here, it is ALLOWED unless the Main Prompt says otherwise).
@@ -339,18 +376,24 @@ async function getAIDecision(pageData, ruleData) {
     }
 
     **CRITICAL INSTRUCTIONS (Priority Order):**
-    1. **User's Main Prompt:** Highest priority. If they explicitly allow a topic, ALLOW it.
-    2. **Platform Overrides Content (CRITICAL):**
+    1. **Time Limits (HIGHEST PRIORITY):** 
+       - **TIMER BLOCKS (duration):** "for 30 mins", "for 2 hours" → Use TIMER BLOCK MATH above. If REMAINING > 0, enforce rule. Include "(X mins left)" in reason. If expired → ALLOW with reason "Timer expired".
+       - **CLOCK BLOCKS (absolute time):** "until 5pm", "after 9am", "before noon" → Use CLOCK BLOCK MATH above. Compare CURRENT TIME (24h) with target time.
+         - "until 5pm" (17:00): If current < 17:00 → enforce rule with "(until 5pm)", else ALLOW with reason "Past 5:00 PM"
+         - "after 6pm" (18:00): If current >= 18:00 → enforce rule, else ALLOW with reason "Before 6:00 PM"
+         - "block until 9am": If current >= 9:00 → ALLOW with reason "Past 9:00 AM"
+    2. **User's Main Prompt:** If they explicitly allow a topic, ALLOW it.
+    3. **Platform Overrides Content (CRITICAL):**
        - If the URL belongs to a known platform, you MUST classify it under that platform's category, regardless of the specific content.
        - **YouTube/Twitch** = **Streaming Services** (NOT Entertainment, NOT Education).
        - **Netflix/Hulu** = **Entertainment** (NOT Streaming).
        - **Example:** A YouTube video about "History" is "Streaming Services". If "Streaming Services" is Unchecked, ALLOW it.
-    3. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
-    4. **Unchecked Categories:**
+    4. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
+    5. **Unchecked Categories:**
        - If a category is **NOT** listed in "Explicitly Blocked Categories", do **NOT** use that category as a reason to block.
        - **Exception:** If the User's Main Prompt explicitly asks to "block distractions", you SHOULD block Social/Entertainment/Games even if unchecked.
        - Only block unlisted categories if they **DIRECTLY CONFLICT** with the User's Main Prompt.
-    5. **Reasoning Clarity:**
+    6. **Reasoning Clarity:**
        - If you **ALLOW** because no rule is violated, set reason to: **"No relevant blocking rules found"**.
     `;
 
@@ -372,16 +415,37 @@ async function getAIDecision(pageData, ruleData) {
             return { decision: 'BLOCK', reason: 'AI Blocked (Parse Error)' };
         }
     } catch (error) {
-        console.error('AI Error:', error.message);
+        // Enhanced error logging for debugging
+        console.error('❌ AI Error Details:');
+        console.error('   Message:', error.message);
+        console.error('   Name:', error.name);
+        console.error('   Status:', error.status || 'N/A');
+        console.error('   Code:', error.code || 'N/A');
+        if (error.message?.includes('429') || error.message?.includes('quota') || error.message?.includes('exhausted')) {
+            console.error('   ⚠️ RATE LIMIT DETECTED - Consider reducing API calls or upgrading tier');
+        }
+        if (error.message?.includes('safety') || error.message?.includes('blocked')) {
+            console.error('   ⚠️ CONTENT SAFETY BLOCK - The page content may have triggered safety filters');
+        }
+        console.error('   URL being checked:', url);
+        console.error('   Full Error:', error);
         return { decision: 'BLOCK', reason: 'AI Error' };
     }
 }
 
 // --- API Endpoint: Check URL ---
 app.post('/check-url', verifyToken, async (req, res) => {
+    requestCount++;
     const pageData = req.body;
     const url = pageData?.url;
     const userId = req.user.id; // From middleware
+
+    // --- DETAILED DUPLICATE TRACKING ---
+    const normalizedUrl = url ? url.split('?')[0].replace(/\/$/, '') : 'unknown';
+    console.log(`\n📥 [REQ #${requestCount}] /check-url`);
+    console.log(`   URL: ${normalizedUrl}`);
+    console.log(`   Title: ${pageData?.title || 'N/A'}`);
+    console.log(`   Time: ${new Date().toISOString()}`);
 
     if (!url) return res.status(400).json({ error: 'Missing URL' });
 
@@ -496,14 +560,14 @@ app.post('/check-url', verifyToken, async (req, res) => {
 // --- API Endpoint: Manual Log (for Shorts Session) ---
 app.post('/log-event', verifyToken, async (req, res) => {
     // Get log data from the background script
-    const { title, reason, decision } = req.body;
+    const { title, reason, decision, url } = req.body;
     const userId = req.user.id;
 
     try {
         // Use our existing helper to log the event
         await logBlockingEvent({
             userId: userId,
-            url: 'https://www.youtube.com/shorts', // Use a generic URL
+            url: url || 'https://www.youtube.com/shorts', // Use provided URL or fallback
             decision: decision || 'ALLOW',
             reason: reason || 'Shorts Session',
             pageTitle: title
@@ -556,12 +620,13 @@ app.post('/report-bug', async (req, res) => {
     // but the frontend sends a token if available.
     // Ideally, we should verify token if provided, but for simplicity we'll just accept it.
 
-    const { description, steps, anonymous, user_id, user_email, timestamp, recipient } = req.body;
+    const { description, steps, anonymous, user_id, user_email, screenshot_url, timestamp, recipient } = req.body;
 
     console.log(`\n🐛 BUG REPORT RECEIVED:`);
     console.log(`To: ${recipient}`);
     console.log(`From: ${anonymous ? 'Anonymous' : user_id}`);
     console.log(`Email: ${anonymous ? 'Hidden' : user_email}`);
+    console.log(`Screenshot: ${screenshot_url ? 'Yes' : 'No'}`);
     console.log(`Using Service Key: ${!!process.env.SUPABASE_SERVICE_ROLE_KEY}`);
 
     try {
@@ -573,6 +638,7 @@ app.post('/report-bug', async (req, res) => {
             steps,
             anonymous,
             recipient,
+            screenshot_url: screenshot_url || null,
             created_at: timestamp || new Date().toISOString()
         }).select();
 
@@ -612,6 +678,9 @@ ${description}
 
 Steps to Reproduce:
 ${steps || 'N/A'}
+
+Screenshot:
+${screenshot_url || 'None attached'}
 
 Timestamp: ${timestamp}
                 `
@@ -745,3 +814,35 @@ app.listen(port, () => {
     console.log(`✅ SERVER IS LIVE on port ${port}`);
 });
 console.log(`DEBUG: Attempting to listen on port ${port}...`);
+
+// --- DEPRECATED: /classify-url endpoint ---
+// This was a duplicate of /check-url and caused double API calls.
+// Kept commented for reference but should not be used.
+/*
+app.post('/classify-url', async (req, res) => {
+    try {
+        const { pageData, auth } = req.body;
+
+        if (!auth || !auth.access_token) {
+            console.log('Request rejected: Missing Auth');
+            return res.status(401).json({ decision: 'BLOCK', reason: 'Unauthorized' });
+        }
+
+        const { data: { user }, error: authError } = await supabaseAdmin.auth.getUser(auth.access_token);
+        if (authError || !user) {
+            console.log('Request rejected: Invalid Token');
+            return res.status(401).json({ decision: 'BLOCK', reason: 'Invalid Token' });
+        }
+
+        const ruleData = await getUserRuleData(user.id);
+        const aiResult = await getAIDecision(pageData, ruleData);
+        
+        console.log(`🤖 AI Decision: ${aiResult.decision} (${aiResult.reason})`);
+        res.json(aiResult);
+
+    } catch (error) {
+        console.error('Server Error:', error);
+        res.status(500).json({ decision: 'BLOCK', reason: 'Server Error' });
+    }
+});
+*/
