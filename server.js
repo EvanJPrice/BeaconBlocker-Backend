@@ -372,7 +372,7 @@ async function getAIDecision(pageData, ruleData) {
     Respond with valid JSON ONLY. No markdown formatting.
     {
         "decision": "ALLOW" or "BLOCK",
-        "reason": "A short, concise explanation (max 10 words) for the user."
+        "reason": "A short, concise explanation (max 6 words). State only the rationale - DO NOT mention 'blocked', 'blocking', or 'allowed'. Examples: 'Social Media', 'News & Politics', 'Distraction from study goal', 'Matches study topic'."
     }
 
     **CRITICAL INSTRUCTIONS (Priority Order):**
@@ -394,7 +394,9 @@ async function getAIDecision(pageData, ruleData) {
        - **Exception:** If the User's Main Prompt explicitly asks to "block distractions", you SHOULD block Social/Entertainment/Games even if unchecked.
        - Only block unlisted categories if they **DIRECTLY CONFLICT** with the User's Main Prompt.
     6. **Reasoning Clarity:**
-       - If you **ALLOW** because no rule is violated, set reason to: **"No relevant blocking rules found"**.
+       - Give simple, direct reasons: just the category name or brief rationale.
+       - Good examples: "Social Media", "News & Politics", "Off-topic for Biology", "Matches search".
+       - Bad examples: "Social Media is blocked", "This is a blocked category", "Blocked because...".
     `;
 
     try {
@@ -468,29 +470,27 @@ app.post('/check-url', verifyToken, async (req, res) => {
         // 2. Search Engines
         if ((hostname.includes('google.') || hostname.includes('bing.') || hostname.includes('duckduckgo.'))
             && (pathname === '/' || pathname.startsWith('/search'))) {
-            // Log this now!
-            await logBlockingEvent({ userId, url, decision: 'ALLOW', reason: 'Search Engine', pageTitle: pageData?.title });
+            // PRIVACY: await logBlockingEvent({ userId, url, decision: 'ALLOW', reason: 'Search Engine', pageTitle: pageData?.title });
             return res.json({ decision: 'ALLOW' });
         }
 
         // 3. YouTube Browsing
         if (hostname.endsWith('youtube.com')) {
             if (!pathname.startsWith('/watch') && !pathname.startsWith('/shorts')) {
-                // Log navigation too
-                await logBlockingEvent({ userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: pageData?.title });
+                // PRIVACY: await logBlockingEvent({ userId, url, decision: 'ALLOW', reason: 'YouTube Navigation', pageTitle: pageData?.title });
                 return res.json({ decision: 'ALLOW' });
             }
         }
 
         // 4. User Lists
         if (baseDomain && allow_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({ userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title });
+            // PRIVACY: await logBlockingEvent({ userId, url, decision: 'ALLOW', reason: 'Matched Allow List', pageTitle: pageData?.title });
             return res.json({ decision: 'ALLOW' });
         }
 
         if (baseDomain && block_list.some(d => baseDomain === d || baseDomain.endsWith('.' + d))) {
-            await logBlockingEvent({ userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title });
-            return res.json({ decision: 'BLOCK' });
+            // PRIVACY: await logBlockingEvent({ userId, url, decision: 'BLOCK', reason: 'Matched Block List', pageTitle: pageData?.title });
+            return res.json({ decision: 'BLOCK', reason: 'On block list' });
         }
 
         // --- 4.5 SHORTS CIRCUIT (v8.1 - Uses "Shorts" category) ---
@@ -511,14 +511,8 @@ app.post('/check-url', verifyToken, async (req, res) => {
             } else if (isShortsBlocked) {
                 // This is doomscrolling. Block it.
                 console.log("Shorts Circuit: Blocking (Category Toggled, No Search)");
-                await logBlockingEvent({
-                    userId,
-                    url,
-                    decision: 'BLOCK',
-                    reason: 'Category: Short-Form',
-                    pageTitle: pageData?.title || 'YouTube Short'
-                });
-                return res.json({ decision: 'BLOCK' });
+                // PRIVACY: await logBlockingEvent({ userId, url, decision: 'BLOCK', reason: 'Category: Short-Form', pageTitle: pageData?.title || 'YouTube Short' });
+                return res.json({ decision: 'BLOCK', reason: 'Short-form content' });
 
                 // 3. User has NOT blocked shorts and is NOT searching.
             } else {
@@ -544,12 +538,12 @@ app.post('/check-url', verifyToken, async (req, res) => {
         let logTitle = pageData?.title || "Unknown Page";
         if (pageData.searchQuery) logTitle += ` [Search: '${pageData.searchQuery}']`;
 
-        await logBlockingEvent({ userId, url, decision: aiResult.decision, reason: aiResult.reason, pageTitle: logTitle });
-        res.json({ decision: aiResult.decision, cacheVersion: globalCacheVersion });
+        // PRIVACY: await logBlockingEvent({ userId, url, decision: aiResult.decision, reason: aiResult.reason, pageTitle: logTitle });
+        res.json({ decision: aiResult.decision, reason: aiResult.reason, cacheVersion: globalCacheVersion });
 
     } catch (err) {
         console.error("Server Error:", err.message);
-        await logBlockingEvent({ userId, url, decision: 'BLOCK', reason: 'Server Error', pageTitle: pageData?.title });
+        // PRIVACY: await logBlockingEvent({ userId, url, decision: 'BLOCK', reason: 'Server Error', pageTitle: pageData?.title });
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
@@ -558,24 +552,11 @@ app.post('/check-url', verifyToken, async (req, res) => {
 
 
 // --- API Endpoint: Manual Log (for Shorts Session) ---
+// PRIVACY NOTE: This endpoint no longer logs to database - blocks are stored locally in extension
 app.post('/log-event', verifyToken, async (req, res) => {
-    // Get log data from the background script
-    const { title, reason, decision, url } = req.body;
-    const userId = req.user.id;
-
-    try {
-        // Use our existing helper to log the event
-        await logBlockingEvent({
-            userId: userId,
-            url: url || 'https://www.youtube.com/shorts', // Use provided URL or fallback
-            decision: decision || 'ALLOW',
-            reason: reason || 'Shorts Session',
-            pageTitle: title
-        });
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    // PRIVACY: URL logging removed - blocks logged locally in extension only
+    // Previously logged shorts sessions to DB, now just acknowledge receipt
+    res.json({ success: true, message: 'Block logged locally in extension' });
 });
 
 // --- API Endpoint: Clear History ---
