@@ -17,6 +17,8 @@ const cors = require('cors');
 console.log("DEBUG: cors loaded.");
 const { createClient } = require('@supabase/supabase-js');
 console.log("DEBUG: supabase-js loaded.");
+const { decryptPrompt } = require('./cryptoUtils.js');
+console.log("DEBUG: cryptoUtils loaded.");
 
 // --- Setup ---
 console.log("DEBUG: Reading env vars...");
@@ -282,16 +284,27 @@ async function getAIDecision(pageData, ruleData) {
         console.log(`⏱️ DEBUG: Rule is ${diffMinutes} minutes old.`);
 
         timeContext += `**RULE SET:** ${diffMinutes} minutes ago.
-**TIMER BLOCK MATH:** If user sets a duration (e.g., "for 30 mins"):
-    REMAINING = Duration - ${diffMinutes}
-    If REMAINING > 0 → ACTIVE (include "(X mins left)" in reason)
-    If REMAINING <= 0 → EXPIRED → ALLOW
 
-**CLOCK BLOCK MATH:** If user sets an absolute time (e.g., "until 5pm" or "after 3pm"):
+**TIMER BLOCK MATH:** For "block X for 30 mins" patterns:
+    REMAINING = Duration - ${diffMinutes}
+    If REMAINING > 0 → BLOCK (include "(X mins left)" in reason)
+    If REMAINING <= 0 → Timer expired → ALLOW with reason "Timer expired"
+
+**TIMER ALLOW MATH:** For "allow X for 30 mins, then block" patterns:
+    REMAINING = Duration - ${diffMinutes}
+    If REMAINING > 0 → ALLOW (grace period active, include "(X mins left)" in reason)
+    If REMAINING <= 0 → Grace period expired → BLOCK with reason "Grace period ended"
+
+**CLOCK BLOCK MATH:** For "block until 5pm" or "block after 3pm" patterns:
     Convert target to 24h format (5pm = 17:00, 9am = 9:00)
     Current time is ${userHour24}:${String(userMinute).padStart(2, '0')}
     "until 5pm" means BLOCK if current < 17:00, else ALLOW
     "after 6pm" means BLOCK if current >= 18:00, else ALLOW
+
+**CLOCK ALLOW MATH:** For "allow until 5pm, then block" patterns:
+    Convert target to 24h format
+    Current time is ${userHour24}:${String(userMinute).padStart(2, '0')}
+    "allow until 5pm" means ALLOW if current < 17:00, else BLOCK
 `;
     } else {
         console.log("⚠️ DEBUG: No timestamp found. Assuming 0 minutes.");
@@ -299,7 +312,12 @@ async function getAIDecision(pageData, ruleData) {
 `;
     }
 
-    console.log(`AI Input: Title='${title}'`);
+    console.log(`\n========== AI DECISION REQUEST ==========`);
+    console.log(`URL: ${url}`);
+    console.log(`Title: ${title}`);
+    console.log(`User Prompt: "${userMainPrompt}"`);
+    console.log(`Blocked Categories: [${Object.entries(blocked_categories || {}).filter(([, v]) => v === true).map(([k]) => k).join(', ')}]`);
+    console.log(`==========================================\n`);
 
     // --- Auto-Allow Exact Matches ---
     if (searchQuery && title) {
@@ -358,6 +376,9 @@ async function getAIDecision(pageData, ruleData) {
     
     ${timeContext} 
     
+    **COMMON ABBREVIATIONS (expand these in user prompts):**
+    yt = YouTube, ig = Instagram, fb = Facebook, tw = Twitter/X, tt = TikTok, gg = Google, amzn = Amazon, nflx = Netflix
+
     **EXPLICITLY BLOCKED CATEGORIES:** [${explicitBlockList}]
     (If a category is NOT listed here, it is ALLOWED unless the Main Prompt says otherwise).
 
@@ -376,13 +397,17 @@ async function getAIDecision(pageData, ruleData) {
     }
 
     **CRITICAL INSTRUCTIONS (Priority Order):**
-    1. **Time Limits (HIGHEST PRIORITY):** 
-       - **TIMER BLOCKS (duration):** "for 30 mins", "for 2 hours" → Use TIMER BLOCK MATH above. If REMAINING > 0, enforce rule. Include "(X mins left)" in reason. If expired → ALLOW with reason "Timer expired".
-       - **CLOCK BLOCKS (absolute time):** "until 5pm", "after 9am", "before noon" → Use CLOCK BLOCK MATH above. Compare CURRENT TIME (24h) with target time.
-         - "until 5pm" (17:00): If current < 17:00 → enforce rule with "(until 5pm)", else ALLOW with reason "Past 5:00 PM"
-         - "after 6pm" (18:00): If current >= 18:00 → enforce rule, else ALLOW with reason "Before 6:00 PM"
-         - "block until 9am": If current >= 9:00 → ALLOW with reason "Past 9:00 AM"
-    2. **User's Main Prompt:** If they explicitly allow a topic, ALLOW it.
+    1. **User's Main Prompt (HIGHEST PRIORITY):**
+       - If the user explicitly says to BLOCK something (e.g., "block youtube", "block social media"), you MUST BLOCK that content.
+       - If the user explicitly says to ALLOW something, ALLOW it.
+       - Simple prompts like "block youtube" or "please block yt" mean: BLOCK YouTube. No time component needed.
+    2. **Time Limits (Only if time words are present in the prompt):** 
+       - Only apply time logic if the prompt contains words like: "for X mins", "until X pm", "after X am", "for X hours"
+       - **TIMER BLOCKS:** "block X for 30 mins" → If REMAINING > 0, BLOCK. If expired → ALLOW "Timer expired".
+       - **TIMER ALLOWS:** "allow X for 30 mins, then block" → If REMAINING > 0, ALLOW. If expired → BLOCK "Grace period ended".
+       - **CLOCK BLOCKS:** "block until 5pm" → If current < 17:00 → BLOCK, else ALLOW.
+       - **CLOCK ALLOWS:** "allow until 5pm, then block" → If current < 17:00 → ALLOW, else BLOCK.
+       - **If NO time words are in the prompt, ignore all time logic entirely.**
     3. **Platform Overrides Content (CRITICAL):**
        - If the URL belongs to a known platform, you MUST classify it under that platform's category, regardless of the specific content.
        - **YouTube/Twitch** = **Streaming Services** (NOT Entertainment, NOT Education).
@@ -393,10 +418,20 @@ async function getAIDecision(pageData, ruleData) {
        - If a category is **NOT** listed in "Explicitly Blocked Categories", do **NOT** use that category as a reason to block.
        - **Exception:** If the User's Main Prompt explicitly asks to "block distractions", you SHOULD block Social/Entertainment/Games even if unchecked.
        - Only block unlisted categories if they **DIRECTLY CONFLICT** with the User's Main Prompt.
-    6. **Reasoning Clarity:**
-       - Give simple, direct reasons: just the category name or brief rationale.
-       - Good examples: "Social Media", "News & Politics", "Off-topic for Biology", "Matches search".
-       - Bad examples: "Social Media is blocked", "This is a blocked category", "Blocked because...".
+    6. **Reasoning Quality (IMPORTANT for user experience):**
+       - Reasons should feel personal and remind the user WHY content is blocked.
+       - Reference the user's intent when the prompt explicitly mentions the target.
+       - Good examples:
+         - "YouTube (you asked)" - when user prompt mentions YouTube
+         - "Social Media (your rule)" - when blocked by user prompt
+         - "Streaming (30 mins left)" - when timer is active
+         - "Off-topic for studying" - when context matters
+         - "Blocked category: News" - when a category toggle is checked
+       - Bad examples (too generic/boring):
+         - "Streaming Services" - doesn't remind user of their intent
+         - "Blocked" - no context
+         - "This is blocked content" - robotic
+       - Keep it SHORT (max 4-5 words) but MEANINGFUL.
     `;
 
     try {
@@ -524,14 +559,20 @@ app.post('/check-url', verifyToken, async (req, res) => {
 
         // 5. AI Check
         console.log("Proceeding to AI Check...");
+
+        // CRITICAL: Decrypt the prompt before sending to AI
+        // The prompt is stored encrypted in Supabase for privacy
+        const decryptedPrompt = decryptPrompt(ruleData.prompt, userId);
+        const decryptedRuleData = { ...ruleData, prompt: decryptedPrompt };
+
         console.log("DEBUG: Rule Data:", {
-            prompt: ruleData.prompt,
+            prompt: decryptedPrompt, // Log the decrypted prompt
             categories: ruleData.blocked_categories,
-            hasPrompt: ruleData.prompt && ruleData.prompt.trim().length > 0,
+            hasPrompt: decryptedPrompt && decryptedPrompt.trim().length > 0,
             hasCategories: ruleData.blocked_categories && Object.values(ruleData.blocked_categories).some(v => v === true)
         });
 
-        const aiResult = await getAIDecision(pageData, ruleData);
+        const aiResult = await getAIDecision(pageData, decryptedRuleData);
         console.log("DEBUG: AI Result:", aiResult);
         // aiResult is now { decision: "...", reason: "..." }
 
@@ -539,7 +580,16 @@ app.post('/check-url', verifyToken, async (req, res) => {
         if (pageData.searchQuery) logTitle += ` [Search: '${pageData.searchQuery}']`;
 
         // PRIVACY: await logBlockingEvent({ userId, url, decision: aiResult.decision, reason: aiResult.reason, pageTitle: logTitle });
-        res.json({ decision: aiResult.decision, reason: aiResult.reason, cacheVersion: globalCacheVersion });
+        // Include activePrompt in response for BLOCK decisions so it can be shown in block history
+        const response = {
+            decision: aiResult.decision,
+            reason: aiResult.reason,
+            cacheVersion: globalCacheVersion
+        };
+        if (aiResult.decision === 'BLOCK') {
+            response.activePrompt = decryptedPrompt;
+        }
+        res.json(response);
 
     } catch (err) {
         console.error("Server Error:", err.message);
@@ -619,7 +669,6 @@ app.post('/report-bug', async (req, res) => {
             steps,
             anonymous,
             recipient,
-            screenshot_url: screenshot_url || null,
             created_at: timestamp || new Date().toISOString()
         }).select();
 
@@ -690,7 +739,21 @@ app.post('/delete-account', verifyToken, async (req, res) => {
     }
 
     try {
-        // 1. Delete User Data (Rules, Logs, Bug Reports)
+        // 1. Delete User Data
+        // First, clear active_preset_id in rules to remove FK constraint
+        const { error: clearPresetError } = await supabaseAdmin.from('rules').update({ active_preset_id: null }).eq('user_id', userId);
+        if (clearPresetError) {
+            console.error("Error clearing active_preset_id:", clearPresetError);
+            // Continue anyway - may not exist
+        }
+
+        // Delete settings presets (now safe since FK is cleared)
+        const { error: presetsError } = await supabaseAdmin.from('settings_presets').delete().eq('user_id', userId);
+        if (presetsError) {
+            console.error("Error deleting presets:", presetsError);
+            // Continue anyway - table may not exist or user has no presets
+        }
+
         // Using supabaseAdmin to bypass RLS
         const { error: rulesError } = await supabaseAdmin.from('rules').delete().eq('user_id', userId);
         if (rulesError) {
@@ -711,10 +774,18 @@ app.post('/delete-account', verifyToken, async (req, res) => {
             // If this fails, we proceed anyway as it's less critical.
         }
 
+        // Try to delete from feature_requests table if it exists
+        const { error: featureError } = await supabaseAdmin.from('feature_requests').delete().eq('user_id', userId);
+        if (featureError && featureError.code !== 'PGRST116') {
+            console.error("Error deleting feature requests:", featureError);
+            // Continue - table might not exist
+        }
+
         // 2. Delete User Auth Account
+        console.log(`Attempting to delete auth user: ${userId}`);
         const { error: authError } = await supabaseAdmin.auth.admin.deleteUser(userId);
         if (authError) {
-            console.error("Error deleting auth user:", authError);
+            console.error("Error deleting auth user - Full Error:", JSON.stringify(authError, null, 2));
             throw authError;
         }
 
