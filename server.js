@@ -6,22 +6,14 @@ let requestCount = 0; // Total traffic from browser
 let aiCostCount = 0;  // Actual calls to Google (The "Billable" ones)
 
 // --- Imports ---
-console.log("DEBUG: Starting server script...");
 require('dotenv').config();
-console.log("DEBUG: dotenv loaded.");
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-console.log("DEBUG: generative-ai loaded.");
 const express = require('express');
-console.log("DEBUG: express loaded.");
 const cors = require('cors');
-console.log("DEBUG: cors loaded.");
 const { createClient } = require('@supabase/supabase-js');
-console.log("DEBUG: supabase-js loaded.");
 const { decryptPrompt } = require('./cryptoUtils.js');
-console.log("DEBUG: cryptoUtils loaded.");
 
 // --- Setup ---
-console.log("DEBUG: Reading env vars...");
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Try to get service role key
@@ -33,14 +25,10 @@ if (!supabaseUrl || !supabaseKey || !geminiKey) {
 }
 
 const genAI = new GoogleGenerativeAI(geminiKey);
-console.log("DEBUG: Initializing Supabase...");
 const supabase = createClient(supabaseUrl, supabaseKey); // For Auth verification
 // Use Service Role Key for DB writes if available, otherwise fallback (which might fail RLS)
 const supabaseAdmin = supabaseServiceKey ? createClient(supabaseUrl, supabaseServiceKey) : supabase;
 
-console.log("DEBUG: Initializing Gemini...");
-console.log("DEBUG: Connected to Supabase URL:", supabaseUrl);
-if (supabaseServiceKey) console.log("DEBUG: Service Role Key loaded for DB writes.");
 
 const model = genAI.getGenerativeModel({
     model: "gemini-flash-latest",  // Using latest flash model (requires paid tier for sufficient quota)
@@ -54,7 +42,6 @@ app.use(express.json());
 
 // --- Debug Middleware ---
 app.use((req, res, next) => {
-    console.log(`DEBUG: Incoming Request: ${req.method} ${req.url}`);
     next();
 });
 
@@ -191,7 +178,6 @@ async function logBlockingEvent(logData) {
 
     try {
         const domain = getDomainFromUrl(url);
-        console.log(`DEBUG: Attempting to log event for user ${userId} - ${url}`);
 
         // Use supabaseAdmin to bypass RLS
         const { data, error } = await supabaseAdmin.from('blocking_log').insert({
@@ -213,7 +199,6 @@ async function logBlockingEvent(logData) {
 
 async function getUserRuleData(userId) {
     if (!userId) return null;
-    // console.log(`DEBUG: Fetching rules for user ${userId}`);
 
     // MUST use supabaseAdmin to bypass RLS, as the server has no user session
     const { data, error } = await supabaseAdmin
@@ -228,13 +213,11 @@ async function getUserRuleData(userId) {
     }
 
     if (!data || data.length === 0) {
-        // console.log("DEBUG: No rules found for user (New Account?)");
         return { prompt: '', blocked_categories: {}, allow_list: [], block_list: [] };
     }
 
     const ruleData = data[0];
     // DEBUG LOG: Prove that we have the time
-    console.log(`DEBUG: Rule Time Fetch: ${ruleData.last_updated ? 'Success' : 'MISSING'}`)
 
     ruleData.allow_list = ruleData.allow_list || [];
     ruleData.block_list = ruleData.block_list || [];
@@ -281,7 +264,6 @@ async function getAIDecision(pageData, ruleData) {
         const diffMs = now - lastUpdateDate;
         diffMinutes = Math.floor(diffMs / 60000);
 
-        console.log(`⏱️ DEBUG: Rule is ${diffMinutes} minutes old.`);
 
         timeContext += `**RULE SET:** ${diffMinutes} minutes ago.
 
@@ -307,7 +289,6 @@ async function getAIDecision(pageData, ruleData) {
     "allow until 5pm" means ALLOW if current < 17:00, else BLOCK
 `;
     } else {
-        console.log("⚠️ DEBUG: No timestamp found. Assuming 0 minutes.");
         timeContext += `**RULE SET:** Just now (0 minutes ago).
 `;
     }
@@ -350,8 +331,8 @@ async function getAIDecision(pageData, ruleData) {
         'forums': 'Forums' // Added in v8.3
     };
     const CATEGORY_DEFINITIONS = `
-- Social Media: Facebook, Instagram, Twitter/X, LinkedIn, Snapchat, Pinterest, Tumblr.
-- Shorts & Reels: TikTok, YouTube Shorts, Instagram Reels.
+- Social Media: Facebook, Instagram (main feed/posts), Twitter/X, LinkedIn, Snapchat, Pinterest, Tumblr.
+- Shorts & Reels: ONLY applies to specific short-form video PATHS: /shorts/ on YouTube, /reels/ on Instagram, or TikTok.com entirely. Do NOT block Instagram or YouTube just because this category is selected - only block if the URL contains /shorts/ or /reels/.
 - News & Politics: CNN, Fox, BBC, NYT, Washington Post, The Guardian.
 - Movies & TV: Premium Movies & TV Series (Netflix, Hulu, Disney+, HBO, Prime Video). NOT YouTube/Twitch.
 - Streaming Services: User-Generated Content & Live Streams (YouTube, Twitch, Kick). NOT Netflix/Hulu.
@@ -365,6 +346,7 @@ async function getAIDecision(pageData, ruleData) {
 `;
     const selectedCategoryLabels = Object.entries(blocked_categories || {})
         .filter(([, value]) => value === true)
+        .filter(([key]) => key !== 'shorts') // Shorts are handled by code logic (lines 517+), not AI. Passing it to AI causes full-platform blocks.
         .map(([key]) => BLOCKED_CATEGORY_LABELS[key] || key);
 
     const explicitBlockList = selectedCategoryLabels.join(', ');
@@ -413,12 +395,17 @@ async function getAIDecision(pageData, ruleData) {
        - **YouTube/Twitch** = **Streaming Services** (NOT Entertainment, NOT Education).
        - **Netflix/Hulu** = **Entertainment** (NOT Streaming).
        - **Example:** A YouTube video about "History" is "Streaming Services". If "Streaming Services" is Unchecked, ALLOW it.
-    4. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
-    5. **Unchecked Categories:**
+    4. **Shorts & Reels is PATH-SPECIFIC (CRITICAL):**
+       - "Short-Form Content" category ONLY applies if the URL contains /shorts/ or /reels/ in the path.
+       - Instagram.com without /reels/ in the URL is NOT short-form content - it's Social Media.
+       - YouTube.com without /shorts/ in the URL is NOT short-form content - it's Streaming Services.
+       - Do NOT block Instagram or YouTube entirely just because "Short-Form Content" is blocked.
+    5. **Search Match:** If the Search Query matches the video topic, assume productive intent -> ALLOW.
+    6. **Unchecked Categories:**
        - If a category is **NOT** listed in "Explicitly Blocked Categories", do **NOT** use that category as a reason to block.
        - **Exception:** If the User's Main Prompt explicitly asks to "block distractions", you SHOULD block Social/Entertainment/Games even if unchecked.
        - Only block unlisted categories if they **DIRECTLY CONFLICT** with the User's Main Prompt.
-    6. **Reasoning Quality (IMPORTANT for user experience):**
+    7. **Reasoning Quality (IMPORTANT for user experience):**
        - Reasons should feel personal and remind the user WHY content is blocked.
        - Reference the user's intent when the prompt explicitly mentions the target.
        - Good examples:
@@ -426,18 +413,23 @@ async function getAIDecision(pageData, ruleData) {
          - "Social Media (your rule)" - when blocked by user prompt
          - "Streaming (30 mins left)" - when timer is active
          - "Off-topic for studying" - when context matters
-         - "Blocked category: News" - when a category toggle is checked
+         - "Category: News" - when a category toggle is checked (ALWAYS use this format for categories)
        - Bad examples (too generic/boring):
          - "Streaming Services" - doesn't remind user of their intent
          - "Blocked" - no context
          - "This is blocked content" - robotic
+         - "Explicitly blocked category" - too wordy, use "Category: X" instead
        - Keep it SHORT (max 4-5 words) but MEANINGFUL.
     `;
 
     try {
+        console.log('[AI] Calling Gemini generateContent...');
         const result = await model.generateContent(finalPrompt);
+        console.log('[AI] Got result, getting response...');
         const response = await result.response;
+        console.log('[AI] Got response, getting text...');
         const text = response.text().trim().replace(/```json/g, '').replace(/```/g, ''); // Clean markdown
+        console.log('[AI] Response text:', text);
 
         try {
             const jsonResponse = JSON.parse(text);
@@ -529,7 +521,9 @@ app.post('/check-url', verifyToken, async (req, res) => {
         }
 
         // --- 4.5 SHORTS CIRCUIT (v8.1 - Uses "Shorts" category) ---
-        if (pathname.startsWith('/shorts/') || pathname.startsWith('/reels/') || baseDomain.includes('tiktok')) {
+        // Only match specific video URLs, not feed pages
+        const isTikTokVideo = baseDomain.includes('tiktok') && pathname.includes('/video/');
+        if (pathname.startsWith('/shorts/') || pathname.startsWith('/reels/') || pathname.startsWith('/reel/') || isTikTokVideo) {
             // Check the NEW "shorts" category from the dashboard
             const isShortsBlocked = blocked_categories['shorts'];
             const hasSearch = !!pageData.searchQuery;
@@ -559,21 +553,15 @@ app.post('/check-url', verifyToken, async (req, res) => {
 
         // 5. AI Check
         console.log("Proceeding to AI Check...");
+        console.log("DEBUG: ruleData.prompt (raw from DB):", ruleData.prompt ? ruleData.prompt.substring(0, 50) + '...' : 'EMPTY');
 
         // CRITICAL: Decrypt the prompt before sending to AI
         // The prompt is stored encrypted in Supabase for privacy
         const decryptedPrompt = decryptPrompt(ruleData.prompt, userId);
+        console.log("DEBUG: decryptedPrompt:", decryptedPrompt ? decryptedPrompt.substring(0, 50) + '...' : 'EMPTY');
         const decryptedRuleData = { ...ruleData, prompt: decryptedPrompt };
 
-        console.log("DEBUG: Rule Data:", {
-            prompt: decryptedPrompt, // Log the decrypted prompt
-            categories: ruleData.blocked_categories,
-            hasPrompt: decryptedPrompt && decryptedPrompt.trim().length > 0,
-            hasCategories: ruleData.blocked_categories && Object.values(ruleData.blocked_categories).some(v => v === true)
-        });
-
         const aiResult = await getAIDecision(pageData, decryptedRuleData);
-        console.log("DEBUG: AI Result:", aiResult);
         // aiResult is now { decision: "...", reason: "..." }
 
         let logTitle = pageData?.title || "Unknown Page";
@@ -865,7 +853,6 @@ app.get('/test-email', async (req, res) => {
 app.listen(port, () => {
     console.log(`✅ SERVER IS LIVE on port ${port}`);
 });
-console.log(`DEBUG: Attempting to listen on port ${port}...`);
 
 // --- DEPRECATED: /classify-url endpoint ---
 // This was a duplicate of /check-url and caused double API calls.
