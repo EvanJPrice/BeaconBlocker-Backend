@@ -621,7 +621,7 @@ app.post('/check-url', verifyToken, async (req, res) => {
             const lastUpdateDate = new Date(ruleData.last_updated);
             const elapsedSeconds = Math.floor((now - lastUpdateDate) / 1000);
 
-            // Match timer patterns
+            // Match timer patterns (for X seconds/minutes/hours)
             const timerMatch = decryptedPrompt.match(/for\s+(?:\w+\s+)?(?:\w+\s+)?(?:\w+\s+)?(\d+)\s*(second|sec|minute|min|hour|hr)s?/i);
 
             if (timerMatch) {
@@ -638,6 +638,87 @@ app.post('/check-url', verifyToken, async (req, res) => {
                 if (remaining <= 0) {
                     console.log('[TIMER CHECK] Timer EXPIRED - returning ALLOW');
                     return res.json({ decision: 'ALLOW', reason: 'Timer expired', cacheVersion: globalCacheVersion });
+                }
+            }
+
+            // --- SERVER-SIDE CLOCK CHECK (until X:XX pm/am or after X:XX pm/am) ---
+            // Match various natural language patterns:
+            // "until 3pm", "until 3:30pm", "until 3:30 pm", "at 2:50", "by 5pm"
+            // Try multiple patterns for flexibility
+
+            let clockData = null;
+
+            // Pattern 1: "until/after/at/by X:XX am/pm" (with am/pm) - CAPTURE the keyword
+            let clockMatch = decryptedPrompt.match(/(until|after|at|by)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+            if (clockMatch) {
+                const keywordRaw = clockMatch[1].toLowerCase();
+                // "at" and "by" usually mean "until" in blocking context
+                const keyword = (keywordRaw === 'at' || keywordRaw === 'by') ? 'until' : keywordRaw;
+                clockData = {
+                    keyword: keyword,
+                    hour: parseInt(clockMatch[2]),
+                    minute: clockMatch[3] ? parseInt(clockMatch[3]) : 0,
+                    ampm: clockMatch[4].toLowerCase()
+                };
+            }
+
+            // Pattern 2: "X:XX am/pm" anywhere (e.g., "I get out at 2:50 pm")
+            if (!clockData) {
+                clockMatch = decryptedPrompt.match(/(\d{1,2}):(\d{2})\s*(am|pm)/i);
+                if (clockMatch) {
+                    clockData = {
+                        keyword: 'until', // Assume "until" for blocking context
+                        hour: parseInt(clockMatch[1]),
+                        minute: parseInt(clockMatch[2]),
+                        ampm: clockMatch[3].toLowerCase()
+                    };
+                }
+            }
+
+            // Pattern 3: "until/by X" without am/pm (assumes PM for 1-11)
+            if (!clockData) {
+                const simpleMatch = decryptedPrompt.match(/(until|by)\s+(\d{1,2})(?::(\d{2}))?(?!\s*(?:am|pm|second|sec|min|hour))/i);
+                if (simpleMatch) {
+                    const hour = parseInt(simpleMatch[2]);
+                    const isPM = hour >= 1 && hour <= 11;
+                    clockData = {
+                        keyword: 'until',
+                        hour: hour,
+                        minute: simpleMatch[3] ? parseInt(simpleMatch[3]) : 0,
+                        ampm: isPM ? 'pm' : 'am'
+                    };
+                }
+            }
+
+            if (clockData) {
+                let targetHour = clockData.hour;
+                const targetMinute = clockData.minute;
+                const ampm = clockData.ampm;
+                const keyword = clockData.keyword;
+
+                // Convert to 24-hour format
+                if (ampm === 'pm' && targetHour !== 12) targetHour += 12;
+                if (ampm === 'am' && targetHour === 12) targetHour = 0;
+
+                const currentHour = now.getHours();
+                const currentMinute = now.getMinutes();
+                const currentTimeMinutes = currentHour * 60 + currentMinute;
+                const targetTimeMinutes = targetHour * 60 + targetMinute;
+
+                console.log(`[CLOCK CHECK] Keyword: ${keyword}, Target: ${targetHour}:${String(targetMinute).padStart(2, '0')}, Current: ${currentHour}:${String(currentMinute).padStart(2, '0')}`);
+
+                if (keyword === 'until') {
+                    // "block until 3pm" = BLOCK before 3pm, ALLOW at or after 3pm
+                    if (currentTimeMinutes >= targetTimeMinutes) {
+                        console.log('[CLOCK CHECK] Time passed "until" threshold - returning ALLOW');
+                        return res.json({ decision: 'ALLOW', reason: 'Clock time passed', cacheVersion: globalCacheVersion });
+                    }
+                } else if (keyword === 'after') {
+                    // "block after 6pm" = ALLOW before 6pm, BLOCK at or after 6pm
+                    if (currentTimeMinutes < targetTimeMinutes) {
+                        console.log('[CLOCK CHECK] Before "after" threshold - returning ALLOW');
+                        return res.json({ decision: 'ALLOW', reason: 'Before blocked time', cacheVersion: globalCacheVersion });
+                    }
                 }
             }
         }
