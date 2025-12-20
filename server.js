@@ -614,6 +614,34 @@ app.post('/check-url', verifyToken, async (req, res) => {
         // The prompt is stored encrypted in Supabase for privacy
         const decryptedPrompt = decryptPrompt(ruleData.prompt, userId);
         console.log("DEBUG: decryptedPrompt:", decryptedPrompt ? decryptedPrompt.substring(0, 50) + '...' : 'EMPTY');
+
+        // --- SERVER-SIDE TIMER CHECK (Short-circuit if expired) ---
+        if (decryptedPrompt && ruleData.last_updated) {
+            const now = new Date();
+            const lastUpdateDate = new Date(ruleData.last_updated);
+            const elapsedSeconds = Math.floor((now - lastUpdateDate) / 1000);
+
+            // Match timer patterns
+            const timerMatch = decryptedPrompt.match(/for\s+(?:\w+\s+)?(?:\w+\s+)?(?:\w+\s+)?(\d+)\s*(second|sec|minute|min|hour|hr)s?/i);
+
+            if (timerMatch) {
+                const duration = parseInt(timerMatch[1]);
+                const unitRaw = timerMatch[2].toLowerCase();
+
+                let durationInSeconds = duration * 60; // default to minutes
+                if (unitRaw.startsWith('sec')) durationInSeconds = duration;
+                else if (unitRaw.startsWith('hour') || unitRaw.startsWith('hr')) durationInSeconds = duration * 3600;
+
+                const remaining = durationInSeconds - elapsedSeconds;
+                console.log(`[TIMER CHECK] Duration: ${duration} ${unitRaw}, Elapsed: ${elapsedSeconds}s, Remaining: ${remaining}s`);
+
+                if (remaining <= 0) {
+                    console.log('[TIMER CHECK] Timer EXPIRED - returning ALLOW');
+                    return res.json({ decision: 'ALLOW', reason: 'Timer expired', cacheVersion: globalCacheVersion });
+                }
+            }
+        }
+
         const decryptedRuleData = { ...ruleData, prompt: decryptedPrompt };
 
         const aiResult = await getAIDecision(pageData, decryptedRuleData);
