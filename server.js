@@ -242,7 +242,53 @@ async function getAIDecision(pageData, ruleData) {
     const { title, url, localTime, bodyText, description, keywords, searchQuery } = pageData;
     const { prompt: userMainPrompt, blocked_categories, last_updated } = ruleData;
 
-    // --- 1. DEFINE TIME CONTEXT ---
+    // --- 1. SERVER-SIDE TIMER PARSING ---
+    // Parse time-based patterns from user's prompt and calculate if expired
+    let timerState = null; // Will be { timerType, duration, unit, elapsed, remaining, expired }
+
+    if (userMainPrompt && last_updated) {
+        const now = new Date();
+        const lastUpdateDate = new Date(last_updated);
+        const elapsedMs = now - lastUpdateDate;
+        const elapsedSeconds = Math.floor(elapsedMs / 1000);
+        const elapsedMinutes = Math.floor(elapsedMs / 60000);
+
+        // Match patterns like "for 30 seconds", "for 5 mins", "for 1 hour"
+        const timerMatch = userMainPrompt.match(/for\s+(\d+)\s*(second|sec|minute|min|hour|hr)s?/i);
+
+        if (timerMatch) {
+            const duration = parseInt(timerMatch[1]);
+            const unitRaw = timerMatch[2].toLowerCase();
+
+            // Normalize units
+            let unit = 'minutes';
+            let durationInSeconds = duration * 60;
+
+            if (unitRaw.startsWith('sec')) {
+                unit = 'seconds';
+                durationInSeconds = duration;
+            } else if (unitRaw.startsWith('hour') || unitRaw.startsWith('hr')) {
+                unit = 'hours';
+                durationInSeconds = duration * 3600;
+            }
+
+            const remaining = durationInSeconds - elapsedSeconds;
+            const expired = remaining <= 0;
+
+            timerState = {
+                timerType: 'duration',
+                duration: duration,
+                unit: unit,
+                elapsedSeconds: elapsedSeconds,
+                remaining: Math.max(0, remaining),
+                expired: expired
+            };
+
+            console.log('[TIMER] Parsed timer:', timerState);
+        }
+    }
+
+    // --- 2. DEFINE TIME CONTEXT ---
     let diffMinutes = 0;
 
     // Parse the user's local time for structured data (e.g., "Tuesday, 8:44 AM")
@@ -258,24 +304,32 @@ async function getAIDecision(pageData, ruleData) {
 **CURRENT TIME (12h):** ${userHour12}:${String(userMinute).padStart(2, '0')} ${ampm}
 `;
 
-    // --- 2. CALCULATE RULE AGE (for timer blocks) ---
-    if (last_updated) {
+    // --- 3. ADD SERVER-CALCULATED TIMER STATE ---
+    if (timerState) {
+        if (timerState.expired) {
+            timeContext += `
+**TIMER STATUS: EXPIRED**
+The user set a timer to block for ${timerState.duration} ${timerState.unit}, but that time has passed (${timerState.elapsedSeconds} seconds elapsed).
+→ Since the timer has EXPIRED, you MUST return ALLOW with reason "Timer expired".
+`;
+        } else {
+            const remaining = timerState.remaining;
+            const remainingDisplay = remaining >= 60
+                ? `${Math.floor(remaining / 60)} min ${remaining % 60} sec`
+                : `${remaining} seconds`;
+            timeContext += `
+**TIMER STATUS: ACTIVE (${remainingDisplay} remaining)**
+The user set a timer to block for ${timerState.duration} ${timerState.unit}. Time remaining: ${remainingDisplay}.
+→ Since the timer is ACTIVE, you MUST return BLOCK with reason mentioning the time remaining (e.g., "(${remainingDisplay} left)").
+`;
+        }
+    } else if (last_updated) {
+        // No timer detected, but rules were set - just show elapsed time for clock-based rules
         const lastUpdateDate = new Date(last_updated);
         const diffMs = now - lastUpdateDate;
         diffMinutes = Math.floor(diffMs / 60000);
 
-
         timeContext += `**RULE SET:** ${diffMinutes} minutes ago.
-
-**TIMER BLOCK MATH:** For "block X for 30 mins" patterns:
-    REMAINING = Duration - ${diffMinutes}
-    If REMAINING > 0 → BLOCK (include "(X mins left)" in reason)
-    If REMAINING <= 0 → Timer expired → ALLOW with reason "Timer expired"
-
-**TIMER ALLOW MATH:** For "allow X for 30 mins, then block" patterns:
-    REMAINING = Duration - ${diffMinutes}
-    If REMAINING > 0 → ALLOW (grace period active, include "(X mins left)" in reason)
-    If REMAINING <= 0 → Grace period expired → BLOCK with reason "Grace period ended"
 
 **CLOCK BLOCK MATH:** For "block until 5pm" or "block after 3pm" patterns:
     Convert target to 24h format (5pm = 17:00, 9am = 9:00)
