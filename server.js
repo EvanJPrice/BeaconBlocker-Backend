@@ -253,8 +253,9 @@ async function getAIDecision(pageData, ruleData) {
         const elapsedSeconds = Math.floor(elapsedMs / 1000);
         const elapsedMinutes = Math.floor(elapsedMs / 60000);
 
-        // Match patterns like "for 30 seconds", "for 5 mins", "for 1 hour"
-        const timerMatch = userMainPrompt.match(/for\s+(\d+)\s*(second|sec|minute|min|hour|hr)s?/i);
+        // Match patterns like "for 30 seconds", "for the next 30 seconds", "for about 5 mins"
+        // Allows 0-3 optional words between "for" and the number
+        const timerMatch = userMainPrompt.match(/for\s+(?:\w+\s+)?(?:\w+\s+)?(?:\w+\s+)?(\d+)\s*(second|sec|minute|min|hour|hr)s?/i);
 
         if (timerMatch) {
             const duration = parseInt(timerMatch[1]);
