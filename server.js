@@ -700,8 +700,24 @@ app.post('/check-url', verifyToken, async (req, res) => {
                 if (ampm === 'pm' && targetHour !== 12) targetHour += 12;
                 if (ampm === 'am' && targetHour === 12) targetHour = 0;
 
-                const currentHour = now.getHours();
-                const currentMinute = now.getMinutes();
+                // Parse user's local time from pageData (format: "Friday, 4:27 PM")
+                // This ensures we use the USER's timezone, not server UTC
+                let currentHour = now.getHours(); // fallback to server time
+                let currentMinute = now.getMinutes();
+
+                if (pageData?.localTime) {
+                    const localTimeMatch = pageData.localTime.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+                    if (localTimeMatch) {
+                        currentHour = parseInt(localTimeMatch[1]);
+                        currentMinute = parseInt(localTimeMatch[2]);
+                        const localAmPm = localTimeMatch[3].toLowerCase();
+                        // Convert to 24h
+                        if (localAmPm === 'pm' && currentHour !== 12) currentHour += 12;
+                        if (localAmPm === 'am' && currentHour === 12) currentHour = 0;
+                        console.log(`[CLOCK CHECK] Using USER's local time: ${currentHour}:${String(currentMinute).padStart(2, '0')}`);
+                    }
+                }
+
                 const currentTimeMinutes = currentHour * 60 + currentMinute;
                 const targetTimeMinutes = targetHour * 60 + targetMinute;
 
