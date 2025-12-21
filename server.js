@@ -444,6 +444,10 @@ The user set a timer to block for ${timerState.duration} ${timerState.unit}. Tim
        - **TIMER ALLOWS:** "allow X for 30 mins, then block" → If REMAINING > 0, ALLOW. If expired → BLOCK "Grace period ended".
        - **CLOCK BLOCKS:** "block until 5pm" → If current < 17:00 → BLOCK, else ALLOW.
        - **CLOCK ALLOWS:** "allow until 5pm, then block" → If current < 17:00 → ALLOW, else BLOCK.
+       - **MULTI-SITE CONDITIONAL (CRITICAL):** For prompts like "allow X until 5pm then block X and allow Y":
+         * BEFORE the time: X is ALLOWED, Y follows default rules (likely BLOCK if "block everything else")
+         * AFTER the time: X is BLOCKED, Y is ALLOWED
+         * You MUST check WHICH site the current URL belongs to and apply the correct rule for that specific site at the current time.
        - **If NO time words are in the prompt, ignore all time logic entirely.**
     3. **Platform Overrides Content (CRITICAL):**
        - If the URL belongs to a known platform, you MUST classify it under that platform's category, regardless of the specific content.
