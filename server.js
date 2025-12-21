@@ -650,6 +650,24 @@ app.post('/check-url', verifyToken, async (req, res) => {
             // Supports: until, till, 'til, through, before, by, at, after, starting at, from
             // Also: noon, midnight
 
+            // SKIP server-side clock check for COMPLEX multi-site rules
+            // These patterns indicate the prompt has different rules for different sites/times
+            // Be SPECIFIC to avoid false positives like "I want to study, then block youtube"
+            const isComplexRule = decryptedPrompt && (
+                // TIME + THEN pattern: "until 5pm then block X" or "for 30 minutes then allow Y"
+                /(?:until|till|by|at)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*(?:,?\s*)?(?:and\s+)?then\s+(block|allow)/i.test(decryptedPrompt) ||
+                // AFTER THAT pattern: "after that block X"
+                /after\s+that\s+(block|allow)/i.test(decryptedPrompt) ||
+                // Multiple DIFFERENT block/allow targets (e.g., "block X and allow Y")
+                // Check for "block X and allow Y" or "allow X and block Y" specifically
+                /block\s+\w+.*\band\s+allow/i.test(decryptedPrompt) ||
+                /allow\s+\w+.*\band\s+block/i.test(decryptedPrompt)
+            );
+
+            if (isComplexRule) {
+                console.log('[CLOCK CHECK] Complex multi-site rule detected, deferring to AI');
+            }
+
             let clockData = null;
 
             // Pattern 0: Check for special words "noon" (12pm) and "midnight" (12am)
@@ -748,13 +766,13 @@ app.post('/check-url', verifyToken, async (req, res) => {
 
                 if (keyword === 'until') {
                     // "block until 3pm" = BLOCK before 3pm, ALLOW at or after 3pm
-                    if (currentTimeMinutes >= targetTimeMinutes) {
+                    if (currentTimeMinutes >= targetTimeMinutes && !isComplexRule) {
                         console.log('[CLOCK CHECK] Time passed "until" threshold - returning ALLOW');
                         return res.json({ decision: 'ALLOW', reason: 'Clock time passed', cacheVersion: globalCacheVersion });
                     }
                 } else if (keyword === 'after') {
                     // "block after 6pm" = ALLOW before 6pm, BLOCK at or after 6pm
-                    if (currentTimeMinutes < targetTimeMinutes) {
+                    if (currentTimeMinutes < targetTimeMinutes && !isComplexRule) {
                         console.log('[CLOCK CHECK] Before "after" threshold - returning ALLOW');
                         return res.json({ decision: 'ALLOW', reason: 'Before blocked time', cacheVersion: globalCacheVersion });
                     }
