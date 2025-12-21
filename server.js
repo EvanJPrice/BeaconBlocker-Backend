@@ -641,30 +641,49 @@ app.post('/check-url', verifyToken, async (req, res) => {
                 }
             }
 
-            // --- SERVER-SIDE CLOCK CHECK (until X:XX pm/am or after X:XX pm/am) ---
-            // Match various natural language patterns:
-            // "until 3pm", "until 3:30pm", "until 3:30 pm", "at 2:50", "by 5pm"
-            // Try multiple patterns for flexibility
+            // --- SERVER-SIDE CLOCK CHECK ---
+            // Match various natural language patterns for clock-based blocking
+            // Supports: until, till, 'til, through, before, by, at, after, starting at, from
+            // Also: noon, midnight
 
             let clockData = null;
 
-            // Pattern 1: "until/after/at/by X:XX am/pm" (with am/pm) - CAPTURE the keyword
-            let clockMatch = decryptedPrompt.match(/(until|after|at|by)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
-            if (clockMatch) {
-                const keywordRaw = clockMatch[1].toLowerCase();
-                // "at" and "by" usually mean "until" in blocking context
-                const keyword = (keywordRaw === 'at' || keywordRaw === 'by') ? 'until' : keywordRaw;
-                clockData = {
-                    keyword: keyword,
-                    hour: parseInt(clockMatch[2]),
-                    minute: clockMatch[3] ? parseInt(clockMatch[3]) : 0,
-                    ampm: clockMatch[4].toLowerCase()
-                };
+            // Pattern 0: Check for special words "noon" (12pm) and "midnight" (12am)
+            const noonMatch = decryptedPrompt.match(/(until|till|'til|through|before|by|at|after)\s+noon/i);
+            const midnightMatch = decryptedPrompt.match(/(until|till|'til|through|before|by|at|after)\s+midnight/i);
+
+            if (noonMatch) {
+                const keywordRaw = noonMatch[1].toLowerCase();
+                const keyword = ['at', 'by', 'till', "'til", 'through', 'before'].includes(keywordRaw) ? 'until' : keywordRaw;
+                clockData = { keyword, hour: 12, minute: 0, ampm: 'pm' };
+            } else if (midnightMatch) {
+                const keywordRaw = midnightMatch[1].toLowerCase();
+                const keyword = ['at', 'by', 'till', "'til", 'through', 'before'].includes(keywordRaw) ? 'until' : keywordRaw;
+                clockData = { keyword, hour: 12, minute: 0, ampm: 'am' };
+            }
+
+            // Pattern 1: "until/till/'til/through/before/after/at/by/starting at/from X:XX am/pm"
+            if (!clockData) {
+                let clockMatch = decryptedPrompt.match(/(until|till|'til|through|before|after|at|by|starting\s+at|from)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+                if (clockMatch) {
+                    const keywordRaw = clockMatch[1].toLowerCase().replace(/\s+/g, ' ');
+                    // Map keywords to "until" or "after" semantics
+                    let keyword = 'until';
+                    if (keywordRaw === 'after' || keywordRaw === 'starting at' || keywordRaw === 'from') {
+                        keyword = 'after';
+                    }
+                    clockData = {
+                        keyword: keyword,
+                        hour: parseInt(clockMatch[2]),
+                        minute: clockMatch[3] ? parseInt(clockMatch[3]) : 0,
+                        ampm: clockMatch[4].toLowerCase()
+                    };
+                }
             }
 
             // Pattern 2: "X:XX am/pm" anywhere (e.g., "I get out at 2:50 pm")
             if (!clockData) {
-                clockMatch = decryptedPrompt.match(/(\d{1,2}):(\d{2})\s*(am|pm)/i);
+                let clockMatch = decryptedPrompt.match(/(\d{1,2}):(\d{2})\s*(am|pm)/i);
                 if (clockMatch) {
                     clockData = {
                         keyword: 'until', // Assume "until" for blocking context
@@ -675,9 +694,9 @@ app.post('/check-url', verifyToken, async (req, res) => {
                 }
             }
 
-            // Pattern 3: "until/by X" without am/pm (assumes PM for 1-11)
+            // Pattern 3: "until/till/by X" without am/pm (assumes PM for 1-11)
             if (!clockData) {
-                const simpleMatch = decryptedPrompt.match(/(until|by)\s+(\d{1,2})(?::(\d{2}))?(?!\s*(?:am|pm|second|sec|min|hour))/i);
+                const simpleMatch = decryptedPrompt.match(/(until|till|'til|by)\s+(\d{1,2})(?::(\d{2}))?(?!\s*(?:am|pm|second|sec|min|hour))/i);
                 if (simpleMatch) {
                     const hour = parseInt(simpleMatch[2]);
                     const isPM = hour >= 1 && hour <= 11;
